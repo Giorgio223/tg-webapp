@@ -10,9 +10,6 @@ export async function GET() {
     const state = raw ? JSON.parse(raw) : null;
     return NextResponse.json({ ok: true, state });
   } catch (e: any) {
-    return NextResponse.json(
-      { ok: false, error: e?.message ?? "unknown error" },
-      { status: 500 }
-    );
+    return NextResponse.json({ ok: false, error: e?.message ?? String(e) }, { status: 500 });
   }
 }

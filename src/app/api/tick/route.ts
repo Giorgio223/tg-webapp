@@ -7,140 +7,107 @@ type GameState = {
   roundId: string;
   phase: Phase;
   phaseStartedAt: number;
-  percent: number;
 
-  // цель на раунд (выбираем при старте PLAY)
-  endPercent?: number;
-  betMs?: number;
-  playMs?: number;
-  endMs?: number;
+  // Сервер больше не "рисует" график. Он задаёт конечный результат и параметры.
+  endPercent?: number; // итог раунда (зафиксирован в PLAY/END)
+  seed?: number;       // для "характера" траектории на клиенте
+
+  betMs: number;
+  playMs: number;
+  endMs: number;
 };
 
-const KEY = "game:state";
+const KEY_STATE = "game:state";
+const KEY_HISTORY = "game:history"; // список последних исходов
 
-// Длительности фаз (можешь менять)
 const BET_MS = 7000;
-const PLAY_MS = 9000;
+const PLAY_MS = 12000; // чуть дольше — меньше ощущение "рывка"
 const END_MS = 2500;
 
-function easeOutQuint(t: number) {
-  const x = Math.max(0, Math.min(1, t));
-  return 1 - Math.pow(1 - x, 5);
-}
-
-// Твоя схема вероятностей:
-// - 50%: отрицательный исход 0..-100
-// - 40%: 0..50
-// - 10%: 51..150
-// - 3% : 150..200
-//
-// Так как сумма = 103%, делаем корректно:
-// 50% отрицательный
-// оставшиеся 50% делим пропорционально (40/53, 10/53, 3/53)
-function sampleEndPercent(): number {
-  const r = Math.random();
-
-  // 50% шанс уйти вниз до -100%
-  if (r < 0.5) {
-    // равномерно от -100 до 0 (не включая 0 можно, но не критично)
-    return -100 + Math.random() * 100;
-  }
-
-  // позитивная ветка (50%), внутри — пропорции 40/10/3
-  const w1 = 40;
-  const w2 = 10;
-  const w3 = 3;
-  const sum = w1 + w2 + w3; // 53
-
-  const u = Math.random() * sum;
-
-  if (u < w1) {
-    // 0..50
-    return Math.random() * 50;
-  }
-  if (u < w1 + w2) {
-    // 51..150
-    return 51 + Math.random() * (150 - 51);
-  }
-  // 150..200
-  return 150 + Math.random() * (200 - 150);
-}
-
-function newRoundState(now: number): GameState {
+function newRound(now: number): GameState {
   return {
     roundId: crypto.randomUUID(),
     phase: "BET",
     phaseStartedAt: now,
-    percent: 0,
     betMs: BET_MS,
     playMs: PLAY_MS,
     endMs: END_MS,
   };
 }
 
+// Твои шансы (нормализуем, т.к. 40+10+3+50=103):
+// 50%: 0..-100
+// оставшиеся 50%: 0..50 (40/53), 51..150 (10/53), 150..200 (3/53)
+function sampleEndPercent(): number {
+  const r = Math.random();
+
+  if (r < 0.5) {
+    // вниз до -100
+    return -100 + Math.random() * 100; // [-100..0]
+  }
+
+  const w1 = 40, w2 = 10, w3 = 3;
+  const sum = w1 + w2 + w3; // 53
+  const u = Math.random() * sum;
+
+  if (u < w1) return Math.random() * 50;               // 0..50
+  if (u < w1 + w2) return 51 + Math.random() * 99;     // 51..150
+  return 150 + Math.random() * 50;                     // 150..200
+}
+
 export async function POST() {
   try {
     const redis = getRedis();
-
     const now = Date.now();
-    const raw = await redis.get(KEY);
 
-    let state: GameState = raw ? JSON.parse(raw) : newRoundState(now);
-
-    const betMs = state.betMs ?? BET_MS;
-    const playMs = state.playMs ?? PLAY_MS;
-    const endMs = state.endMs ?? END_MS;
+    const raw = await redis.get(KEY_STATE);
+    let state: GameState = raw ? JSON.parse(raw) : newRound(now);
 
     const elapsed = now - state.phaseStartedAt;
 
     if (state.phase === "BET") {
-      // В BET проценты "не считаются": всегда 0 на сервере.
-      // (визуальная волна у тебя рисуется на клиенте)
-      state.percent = 0;
-
-      if (elapsed >= betMs) {
-        // старт PLAY: выбираем итог на раунд
-        const endPercent = sampleEndPercent();
+      if (elapsed >= state.betMs) {
+        // старт PLAY: выбираем итог и seed
         state = {
           ...state,
           phase: "PLAY",
           phaseStartedAt: now,
-          percent: 0,
-          endPercent,
+          endPercent: sampleEndPercent(),
+          seed: Math.floor(Math.random() * 1_000_000_000),
         };
       }
     } else if (state.phase === "PLAY") {
-      const endPercent = typeof state.endPercent === "number" ? state.endPercent : sampleEndPercent();
+      if (elapsed >= state.playMs) {
+        // фиксируем END
+        const endPercent = typeof state.endPercent === "number" ? state.endPercent : 0;
 
-      // плавное движение к цели за PLAY_MS
-      const t = Math.min(1, elapsed / playMs);
-      state.percent = easeOutQuint(t) * endPercent;
-
-      if (elapsed >= playMs) {
-        // фиксируем финал
         state = {
           ...state,
           phase: "END",
           phaseStartedAt: now,
-          percent: endPercent,
+          endPercent,
         };
+
+        // записываем историю (последние 12)
+        await redis.lpush(KEY_HISTORY, JSON.stringify({ t: now, v: endPercent }));
+        await redis.ltrim(KEY_HISTORY, 0, 11);
       }
     } else if (state.phase === "END") {
-      // держим финал
-      state.percent = state.percent ?? 0;
-
-      if (elapsed >= endMs) {
-        // новый раунд
-        state = newRoundState(now);
+      if (elapsed >= state.endMs) {
+        state = newRound(now);
       }
     }
 
-    await redis.set(KEY, JSON.stringify(state));
-    return NextResponse.json({ ok: true, state });
+    await redis.set(KEY_STATE, JSON.stringify(state));
+
+    // отдадим историю вместе с tick, чтобы UI мог рисовать
+    const histRaw = await redis.lrange(KEY_HISTORY, 0, 11);
+    const history = histRaw.map((x) => {
+      try { return JSON.parse(x); } catch { return null; }
+    }).filter(Boolean);
+
+    return NextResponse.json({ ok: true, state, history });
   } catch (e: any) {
-    return NextResponse.json(
-      { ok: false, error: e?.message ?? String(e) },
-      { status: 500 }
-    );
+    return NextResponse.json({ ok: false, error: e?.message ?? String(e) }, { status: 500 });
   }
 }
