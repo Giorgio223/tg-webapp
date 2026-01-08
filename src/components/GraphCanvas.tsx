@@ -68,7 +68,7 @@ export default function GraphCanvas({ state, width, height = 480 }: Props) {
     return {
       windowMs: 26000,
       padL: 18,
-      padR: 86, // чуть больше под шкалу
+      padR: 86,
       padT: 18,
       padB: 26,
     };
@@ -99,10 +99,6 @@ export default function GraphCanvas({ state, width, height = 480 }: Props) {
       last = ts;
 
       const parent = canvas.parentElement;
-
-      // адаптивная ширина:
-      // - на телефоне почти вся ширина
-      // - на десктопе до 1200px
       const containerW = parent?.clientWidth ?? 900;
       const cssW = width ?? Math.max(320, Math.min(1200, containerW));
       const cssH = height;
@@ -125,7 +121,7 @@ export default function GraphCanvas({ state, width, height = 480 }: Props) {
       const alpha = 0.14 * k;
       smoothRef.current = smoothRef.current + (targetRef.current - smoothRef.current) * alpha;
 
-      const phase = state?.phase ?? "BET";
+      const phase: Phase = (state?.phase ?? "BET") as Phase;
 
       const wobbleAmp = phase === "BET" ? 1.4 : phase === "PLAY" ? 0.55 : 0.0;
       const vNow = smoothRef.current + organicNoise(Date.now()) * wobbleAmp;
@@ -146,6 +142,7 @@ export default function GraphCanvas({ state, width, height = 480 }: Props) {
       ctx.lineWidth = 1;
       ctx.strokeRect(plotL, plotT, plotW, plotH);
 
+      // 0% dashed линия по центру
       const yZero = plotT + plotH / 2;
       ctx.save();
       ctx.setLineDash([6, 6]);
@@ -157,6 +154,7 @@ export default function GraphCanvas({ state, width, height = 480 }: Props) {
       ctx.stroke();
       ctx.restore();
 
+      // шкала: BET скрыта, PLAY/END показана — плавно
       const showScale = phase !== "BET";
       const targetAlpha = showScale ? 1 : 0;
       scaleAlphaRef.current = scaleAlphaRef.current + (targetAlpha - scaleAlphaRef.current) * (0.10 * k);
@@ -165,6 +163,7 @@ export default function GraphCanvas({ state, width, height = 480 }: Props) {
       if (vNow > 0) lineColor = "rgba(80, 220, 140, 1)";
       if (vNow > 110) lineColor = "rgba(255, 180, 60, 1)";
 
+      // линия
       const hist = historyRef.current;
       const localCutoff = now - view.windowMs;
 
@@ -180,6 +179,7 @@ export default function GraphCanvas({ state, width, height = 480 }: Props) {
       }
       ctx.stroke();
 
+      // кружок
       const xHead = plotR;
       const yHead = plotT + plotH / 2 - warpPercent(vNow) * (plotH * 0.46);
       ctx.fillStyle = lineColor;
@@ -187,28 +187,32 @@ export default function GraphCanvas({ state, width, height = 480 }: Props) {
       ctx.arc(xHead, yHead, 5, 0, Math.PI * 2);
       ctx.fill();
 
-      const badgeText = `${vNow.toFixed(0)}%`;
-      ctx.font = "14px system-ui";
-      const tw = ctx.measureText(badgeText).width;
-      const bx = plotR - tw - 32;
-      const by = 10;
-      const bw = tw + 26;
-      const bh = 30;
+      // ✅ БЕЙДЖ % — НЕ рисуем в BET
+      const showBadge = phase !== "BET";
+      if (showBadge) {
+        const badgeText = `${vNow.toFixed(0)}%`;
+        ctx.font = "14px system-ui";
+        const tw = ctx.measureText(badgeText).width;
+        const bx = plotR - tw - 32;
+        const by = 10;
+        const bw = tw + 26;
+        const bh = 30;
 
-      ctx.fillStyle = "rgba(10,10,16,0.55)";
-      roundRect(ctx, bx, by, bw, bh, 14);
-      ctx.fill();
+        ctx.fillStyle = "rgba(10,10,16,0.55)";
+        roundRect(ctx, bx, by, bw, bh, 14);
+        ctx.fill();
 
-      ctx.fillStyle = lineColor;
-      ctx.beginPath();
-      ctx.arc(bx + 12, by + bh / 2, 4, 0, Math.PI * 2);
-      ctx.fill();
+        ctx.fillStyle = lineColor;
+        ctx.beginPath();
+        ctx.arc(bx + 12, by + bh / 2, 4, 0, Math.PI * 2);
+        ctx.fill();
 
-      ctx.fillStyle = "rgba(255,255,255,0.92)";
-      ctx.textBaseline = "middle";
-      ctx.fillText(badgeText, bx + 22, by + bh / 2);
+        ctx.fillStyle = "rgba(255,255,255,0.92)";
+        ctx.textBaseline = "middle";
+        ctx.fillText(badgeText, bx + 22, by + bh / 2);
+      }
 
-      // ---- шкала справа: добавлены 50/100/150 и -100/-50/-10 ----
+      // шкала справа (добавлены 50/100/150 и -50/-100/-10)
       const ticks = [200, 150, 100, 50, 30, 10, 0, -10, -50, -100];
 
       const tickItems = ticks
@@ -218,7 +222,6 @@ export default function GraphCanvas({ state, width, height = 480 }: Props) {
         }))
         .sort((a, b) => a.y - b.y);
 
-      // если тесно — показываем меньше, но НЕ двигаем y (честно)
       const chosen: { v: number; y: number }[] = [];
       const minGap = 14;
 
@@ -228,7 +231,6 @@ export default function GraphCanvas({ state, width, height = 480 }: Props) {
         if (!prev || it.y - prev.y >= minGap) chosen.push(it);
       }
 
-      // 0% обязателен
       if (!chosen.some((x) => x.v === 0)) {
         const zero = tickItems.find((x) => x.v === 0);
         if (zero) {
@@ -259,6 +261,7 @@ export default function GraphCanvas({ state, width, height = 480 }: Props) {
       }
       ctx.restore();
 
+      // подпись фазы
       ctx.font = "12px system-ui";
       ctx.fillStyle = "rgba(255,255,255,0.6)";
       ctx.fillText(phase, plotL, cssH - 10);
