@@ -17,8 +17,9 @@ export type GameState = {
 
 type Props = {
   state: GameState | null;
-  width?: number;
   height?: number;
+  width?: number;
+  serverNow: number; // серверное время из /api/state
 };
 
 type Point = { t: number; v: number };
@@ -46,79 +47,83 @@ function roundRect(ctx: CanvasRenderingContext2D, x: number, y: number, w: numbe
   ctx.closePath();
 }
 
-// RNG
-function makeRng(seed: number) {
-  let s = (seed >>> 0) || 1;
-  return () => {
-    s = (Math.imul(1664525, s) + 1013904223) >>> 0;
-    return s / 4294967296;
-  };
+function smoothstep(x: number) {
+  const t = clamp(x, 0, 1);
+  return t * t * (3 - 2 * t);
 }
 
-function lerp(a: number, b: number, t: number) {
-  return a + (b - a) * t;
+// детерминированные “фазы” для синусов из seed
+function phaseFromSeed(seed: number, k: number) {
+  const s = (seed * 9301 + 49297 + k * 233280) % 233280;
+  return (s / 233280) * Math.PI * 2;
 }
 
-export default function GraphCanvas({ state, width, height = 480 }: Props) {
+function fbm(t: number, seed: number) {
+  // fBm на синусах — детерминированно, гладко, “живее” чем 1 синус
+  const p1 = phaseFromSeed(seed, 1);
+  const p2 = phaseFromSeed(seed, 2);
+  const p3 = phaseFromSeed(seed, 3);
+  const p4 = phaseFromSeed(seed, 4);
+
+  return (
+    Math.sin(t * 1.2 + p1) * 0.55 +
+    Math.sin(t * 2.3 + p2) * 0.25 +
+    Math.sin(t * 4.7 + p3) * 0.14 +
+    Math.sin(t * 7.9 + p4) * 0.06
+  );
+}
+
+// PLAY траектория: “рандомное” движение + магнит к end в конце
+function playValue(nowMs: number, state: GameState) {
+  const seed = state.seed ?? 1337;
+  const end = clamp(state.endPercent ?? 0, -100, 200);
+
+  const t01 = clamp((nowMs - state.phaseStartedAt) / state.playMs, 0, 1);
+  const t = (nowMs - state.phaseStartedAt) / 1000;
+
+  // характер (иногда спокойнее/иногда резче) — но у всех одинаково, т.к. зависит от seed
+  const mood = (seed % 1000) / 1000;
+  const aggressive = mood < 0.40;
+
+  // амплитуда “жизни”: больше в середине, меньше к концу
+  const mid = 1 - Math.abs(t01 * 2 - 1); // 0..1
+  const ampBase = aggressive ? 55 : 38;
+  const amp = ampBase * (0.45 + mid * 0.75);
+
+  // основной шум
+  const raw = fbm(t, seed) * amp;
+
+  // “подшутить под конец” — небольшой разворот, который пропадает в финале
+  const teaseW = smoothstep((t01 - 0.72) / 0.20) * (1 - smoothstep((t01 - 0.95) / 0.05));
+  const teaseDir = ((seed >> 4) & 1) ? 1 : -1;
+  const tease = teaseW * teaseDir * Math.sin(t * 5.2 + phaseFromSeed(seed, 7)) * (aggressive ? 14 : 9);
+
+  const noisy = clamp(raw + tease, -100, 200);
+
+  // магнит к концу: последние 25%
+  const pull = smoothstep((t01 - 0.75) / 0.25);
+
+  // итог: сначала почти noisy, к концу — end
+  const v = (1 - pull) * noisy + pull * end;
+  return clamp(v, -100, 200);
+}
+
+function betValue(nowMs: number, state: GameState) {
+  const seed = state.seed ?? 1337;
+  const t = nowMs / 1000;
+  // строго в ±10%
+  return clamp(fbm(t, seed) * 8.5, -10, 10);
+}
+
+export default function GraphCanvas({ state, width, height = 480, serverNow }: Props) {
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
-
   const historyRef = useRef<Point[]>([]);
-  const currentRoundRef = useRef<string | null>(null);
-
   const rafRef = useRef<number | null>(null);
   const scaleAlphaRef = useRef<number>(1);
 
-  // random walk state (переживает смены фаз, чтобы не было рывков)
-  const walkRef = useRef<{
-    seed: number;
-    lastMs: number;
-    v: number;
-    vel: number;
-    rng: () => number;
-    // "характер" текущего раунда
-    aggressive: boolean;
-    // сглаженное значение (для отрисовки без резких ступеней)
-    smoothV: number;
-  } | null>(null);
-
-  // запоминаем последнюю фазу для мягких переходов
-  const prevPhaseRef = useRef<Phase>("BET");
-
   const view = useMemo(() => {
-    return {
-      windowMs: 26000,
-      padL: 18,
-      padR: 90,
-      padT: 18,
-      padB: 26,
-    };
+    return { windowMs: 26000, padL: 18, padR: 90, padT: 18, padB: 26 };
   }, []);
-
-  useEffect(() => {
-    if (!state) return;
-
-    // новый раунд: обновим seed/характер, но НЕ сбрасываем v в ноль — берём текущую точку
-    if (currentRoundRef.current !== state.roundId) {
-      currentRoundRef.current = state.roundId;
-
-      const seed = state.seed ?? Math.floor(Math.random() * 1_000_000_000);
-      const rng = makeRng(seed);
-      const aggressive = rng() < 0.40; // 40% раундов более резкие, но не “стена”
-
-      const now = Date.now();
-      const prev = walkRef.current;
-
-      walkRef.current = {
-        seed,
-        lastMs: now,
-        v: prev?.v ?? 0,
-        vel: prev?.vel ?? 0,
-        rng,
-        aggressive,
-        smoothV: prev?.smoothV ?? (prev?.v ?? 0),
-      };
-    }
-  }, [state]);
 
   useEffect(() => {
     const canvas = canvasRef.current;
@@ -127,6 +132,14 @@ export default function GraphCanvas({ state, width, height = 480 }: Props) {
     if (!ctx) return;
 
     let last = performance.now();
+    let localServerOffset = 0;
+
+    // подтягиваем локальный offset к serverNow (чтобы таймер не улетал при лагах)
+    const syncServerClock = () => {
+      const clientNow = Date.now();
+      localServerOffset = serverNow - clientNow;
+    };
+    syncServerClock();
 
     const draw = (ts: number) => {
       const dt = ts - last;
@@ -151,160 +164,33 @@ export default function GraphCanvas({ state, width, height = 480 }: Props) {
       const plotR = plotL + plotW;
       const plotB = plotT + plotH;
 
-      const phase: Phase = (state?.phase ?? "BET") as Phase;
-      const seed = state?.seed ?? 1337;
-      const end = typeof state?.endPercent === "number" ? state!.endPercent! : 0;
-      const playMs = state?.playMs ?? 12000;
-      const betMs = state?.betMs ?? 7000;
-      const phaseStartedAt = state?.phaseStartedAt ?? Date.now();
+      // берём "серверное" текущее время
+      const now = Date.now() + localServerOffset;
 
-      // шкала: скрыта в BET
+      const phase: Phase = (state?.phase ?? "BET") as Phase;
+
       const showScale = phase !== "BET";
       const k = clamp(dt / 16.7, 0.8, 1.8);
       scaleAlphaRef.current = scaleAlphaRef.current + ((showScale ? 1 : 0) - scaleAlphaRef.current) * (0.10 * k);
 
-      const now = Date.now();
+      let vNow = 0;
 
-      // walk init safeguard
-      if (!walkRef.current) {
-        const rng = makeRng(seed);
-        walkRef.current = {
-          seed,
-          lastMs: now,
-          v: 0,
-          vel: 0,
-          rng,
-          aggressive: rng() < 0.40,
-          smoothV: 0,
-        };
-      }
-
-      const walk = walkRef.current;
-      const rng = walk.rng;
-
-      // ----------------------------
-      // ЖИВОЙ ГРАФИК С МЯГКОСТЬЮ + МИКС
-      // ----------------------------
-      let vNow = walk.v;
-
-      const step = clamp((now - walk.lastMs) / 16.7, 0.5, 2.5);
-      walk.lastMs = now;
-
-      if (phase === "BET") {
-        // BET: колыбель от текущей точки + мягкий возврат к 0 (без рывка)
-        // сила возврата
-        const pullToZero = 0.015 * step; // очень мягко
-        walk.v = walk.v + (0 - walk.v) * pullToZero;
-
-        // лёгкий шум вокруг текущего v
-        const noise = (rng() - 0.5) * 0.9; // меньше резкости
-        walk.vel += noise * 0.08 * step;
-
-        // ограничение скорости (BET очень спокойный)
-        walk.vel = clamp(walk.vel, -0.9, 0.9);
-        walk.v += walk.vel * 0.55 * step;
-
-        // держим BET возле центра (но не в точке 0)
-        walk.v = clamp(walk.v, -18, 18);
-
-        vNow = walk.v;
+      if (!state) {
+        vNow = 0;
+      } else if (phase === "BET") {
+        vNow = betValue(now, state);
       } else if (phase === "PLAY") {
-        const t01 = clamp((now - phaseStartedAt) / playMs, 0, 1);
-
-        // "характер": иногда спокойнее, иногда резче
-        const aggressive = walk.aggressive;
-
-        // базовая плавность: добавим трение (снимает резкость)
-        const friction = aggressive ? 0.88 : 0.92;
-        walk.vel *= Math.pow(friction, step);
-
-        // дрейф направления (мягче чем раньше)
-        const drift = (rng() - 0.5) * (aggressive ? 0.75 : 0.45);
-        walk.vel += drift * 0.12 * step;
-
-        // редкие “повороты” но без стены
-        if (rng() < (aggressive ? 0.012 : 0.006)) {
-          walk.vel *= -0.75;
-          walk.v += (rng() - 0.5) * (aggressive ? 10 : 6);
-        }
-
-        // обновляем v
-        const velMax = aggressive ? 2.2 : 1.6;
-        walk.vel = clamp(walk.vel, -velMax, velMax);
-        walk.v += walk.vel * (aggressive ? 1.25 : 0.95) * step;
-
-        // мягкие границы
-        const minV = -100;
-        const maxV = 200;
-        if (walk.v < minV) {
-          walk.v = minV + (minV - walk.v) * 0.22;
-          walk.vel *= -0.45;
-        }
-        if (walk.v > maxV) {
-          walk.v = maxV - (walk.v - maxV) * 0.22;
-          walk.vel *= -0.45;
-        }
-
-        // ---- МАГНИТ К КОНЦУ (позже и мягче, чтобы не "улетал сразу") ----
-        // старт притяжения позже: 0.78
-        const pullStart = 0.78;
-        const pullT = clamp((t01 - pullStart) / (1 - pullStart), 0, 1);
-
-        // плавный рост, без скачка
-        const pull = pullT * pullT * (2.2 + pullT * 5.5);
-
-        walk.v = walk.v + (end - walk.v) * (pull * 0.020);
-        walk.vel *= (1 - pullT * 0.06);
-
-        // последние 1.5% фиксируем
-        if (t01 > 0.985) {
-          walk.v = end;
-          walk.vel = 0;
-        }
-
-        vNow = walk.v;
+        vNow = playValue(now, state);
       } else {
-        // END
-        walk.v = end;
-        walk.vel = 0;
-        vNow = end;
-      }
-
-      // --------
-      // СГЛАЖИВАНИЕ ОТРИСОВКИ (убирает резкие ступени, но сохраняет азарт)
-      // --------
-      // чем больше dt, тем быстрее догоняет
-      const smoothAlpha = clamp(0.10 * k, 0.06, 0.18);
-      walk.smoothV = walk.smoothV + (vNow - walk.smoothV) * smoothAlpha;
-      vNow = walk.smoothV;
-
-      vNow = clamp(vNow, -100, 200);
-
-      // плавный переход PLAY->BET без "стены" в истории:
-      // если фаза изменилась, добавим 2-3 интерполяционные точки
-      const prevPhase = prevPhaseRef.current;
-      if (prevPhase !== phase) {
-        prevPhaseRef.current = phase;
-
-        const lastP = historyRef.current[historyRef.current.length - 1];
-        if (lastP) {
-          const mid1 = lerp(lastP.v, vNow, 0.35);
-          const mid2 = lerp(lastP.v, vNow, 0.70);
-          historyRef.current.push({ t: now - 24, v: mid1 });
-          historyRef.current.push({ t: now - 12, v: mid2 });
-        }
+        vNow = clamp(state.endPercent ?? 0, -100, 200);
       }
 
       // история линии
       historyRef.current.push({ t: now, v: vNow });
       const cutoff = now - view.windowMs;
-      while (historyRef.current.length > 2 && historyRef.current[0].t < cutoff) {
-        historyRef.current.shift();
-      }
+      while (historyRef.current.length > 2 && historyRef.current[0].t < cutoff) historyRef.current.shift();
 
-      // ----------------------------
-      // РЕНДЕР
-      // ----------------------------
+      // фон
       ctx.clearRect(0, 0, cssW, cssH);
       ctx.fillStyle = "#0b1220";
       ctx.fillRect(0, 0, cssW, cssH);
@@ -313,7 +199,7 @@ export default function GraphCanvas({ state, width, height = 480 }: Props) {
       ctx.lineWidth = 1;
       ctx.strokeRect(plotL, plotT, plotW, plotH);
 
-      // 0% dashed линия
+      // 0% dashed
       const yZero = plotT + plotH / 2;
       ctx.save();
       ctx.setLineDash([6, 6]);
@@ -325,7 +211,7 @@ export default function GraphCanvas({ state, width, height = 480 }: Props) {
       ctx.stroke();
       ctx.restore();
 
-      // цвет
+      // цвет линии
       let lineColor = "rgba(255, 90, 90, 1)";
       if (vNow > 0) lineColor = "rgba(80, 220, 140, 1)";
       if (vNow > 110) lineColor = "rgba(255, 180, 60, 1)";
@@ -346,7 +232,7 @@ export default function GraphCanvas({ state, width, height = 480 }: Props) {
       }
       ctx.stroke();
 
-      // кружок
+      // кружок справа
       const xHead = plotR;
       const yHead = plotT + plotH / 2 - warpPercent(vNow) * (plotH * 0.46);
       ctx.fillStyle = lineColor;
@@ -378,13 +264,12 @@ export default function GraphCanvas({ state, width, height = 480 }: Props) {
         ctx.fillText(badgeText, bx + 22, by + bh / 2);
       }
 
-      // ---- BET таймер по центру: круг + цифра ----
-      if (phase === "BET") {
-        const elapsed = now - phaseStartedAt;
-        const t01 = clamp(elapsed / betMs, 0, 1);
-        const remaining = Math.max(0, Math.ceil((betMs - elapsed) / 1000));
+      // BET таймер-круг по центру
+      if (state && phase === "BET") {
+        const elapsed = now - state.phaseStartedAt;
+        const t01 = clamp(elapsed / state.betMs, 0, 1);
+        const remaining = Math.max(0, Math.min(99, Math.ceil((state.betMs - elapsed) / 1000))); // не улетит в 130
 
-        // цвет: зелёный -> жёлтый -> красный (последние 3 сек)
         let col = "rgba(80, 220, 140, 0.95)";
         if (remaining <= 3) col = "rgba(255, 90, 90, 0.95)";
         else if (t01 > 0.55) col = "rgba(255, 200, 60, 0.95)";
@@ -393,7 +278,6 @@ export default function GraphCanvas({ state, width, height = 480 }: Props) {
         const cy = plotT + plotH * 0.50;
         const r = Math.min(plotW, plotH) * 0.10;
 
-        // фон круга
         ctx.save();
         ctx.globalAlpha = 0.70;
         ctx.strokeStyle = "rgba(255,255,255,0.10)";
@@ -403,7 +287,6 @@ export default function GraphCanvas({ state, width, height = 480 }: Props) {
         ctx.stroke();
         ctx.restore();
 
-        // прогресс дуга (идёт к 0)
         const start = -Math.PI / 2;
         const endA = start + (1 - t01) * Math.PI * 2;
 
@@ -416,7 +299,6 @@ export default function GraphCanvas({ state, width, height = 480 }: Props) {
         ctx.stroke();
         ctx.restore();
 
-        // цифра
         ctx.save();
         ctx.fillStyle = "rgba(255,255,255,0.92)";
         ctx.font = `700 ${Math.max(18, Math.floor(r * 1.0))}px system-ui`;
@@ -426,7 +308,7 @@ export default function GraphCanvas({ state, width, height = 480 }: Props) {
         ctx.restore();
       }
 
-      // шкала справа
+      // шкала справа (ключевые метки)
       const must = [-100, -50, -10, 0, 10, 50, 100, 150, 200];
       const items = must
         .map((v) => ({ v, y: plotT + plotH / 2 - warpPercent(v) * (plotH * 0.46) }))
@@ -438,11 +320,8 @@ export default function GraphCanvas({ state, width, height = 480 }: Props) {
       for (const it of items) {
         const critical = it.v === -100 || it.v === 0 || it.v === 200;
         const prev = chosen[chosen.length - 1];
-        if (!prev) {
-          chosen.push(it);
-          continue;
-        }
-        if (it.y - prev.y >= minGap) chosen.push(it);
+        if (!prev) chosen.push(it);
+        else if (it.y - prev.y >= minGap) chosen.push(it);
         else if (critical) chosen[chosen.length - 1] = it;
       }
 
@@ -468,21 +347,22 @@ export default function GraphCanvas({ state, width, height = 480 }: Props) {
       }
       ctx.restore();
 
-      // подпись фазы
       ctx.font = "12px system-ui";
       ctx.fillStyle = "rgba(255,255,255,0.6)";
       ctx.fillText(phase, plotL, cssH - 10);
+
+      // иногда ресинхроним offset (чтобы не уплыло)
+      if (Math.random() < 0.01) syncServerClock();
 
       rafRef.current = requestAnimationFrame(draw);
     };
 
     rafRef.current = requestAnimationFrame(draw);
-
     return () => {
       if (rafRef.current) cancelAnimationFrame(rafRef.current);
       rafRef.current = null;
     };
-  }, [height, width, view.padB, view.padL, view.padR, view.padT, view.windowMs, state?.phase, state?.roundId]);
+  }, [height, width, view.padB, view.padL, view.padR, view.padT, view.windowMs, state?.roundId, state?.phase, serverNow]);
 
   return (
     <canvas

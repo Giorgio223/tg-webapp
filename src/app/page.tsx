@@ -26,23 +26,21 @@ export default function Page() {
   const [isTelegram, setIsTelegram] = useState(false);
   const [state, setState] = useState<GameState | null>(null);
   const [history, setHistory] = useState<HistItem[]>([]);
+  const [serverNow, setServerNow] = useState<number>(Date.now());
 
   const [balance] = useState<number>(0);
 
   const isMobile = useIsMobile();
   const graphHeight = useMemo(() => (isMobile ? 360 : 460), [isMobile]);
 
-  async function tick() {
-    const r = await fetch("/api/tick", { method: "POST" });
-    const j = await r.json();
-    setState(j.state);
-    setHistory(j.history ?? []);
-  }
-
   async function refresh() {
     const r = await fetch("/api/state", { cache: "no-store" });
     const j = await r.json();
-    setState(j.state);
+    if (j.ok) {
+      setState(j.state);
+      setHistory(j.history ?? []);
+      setServerNow(j.serverNow ?? Date.now());
+    }
   }
 
   useEffect(() => {
@@ -52,28 +50,26 @@ export default function Page() {
       tg.ready();
       tg.expand();
     }
+
     refresh();
-    const id = setInterval(() => tick(), 1000);
+    // 2 раза в секунду достаточно, а график сам плавно рисуется 60fps
+    const id = setInterval(() => refresh(), 500);
     return () => clearInterval(id);
   }, []);
 
   function onUp() {
     window.Telegram?.WebApp?.HapticFeedback?.impactOccurred?.("light");
-    console.log("UP");
   }
   function onDown() {
     window.Telegram?.WebApp?.HapticFeedback?.impactOccurred?.("light");
-    console.log("DOWN");
   }
   function onInsurance() {
     window.Telegram?.WebApp?.HapticFeedback?.impactOccurred?.("medium");
-    console.log("INSURANCE");
   }
 
   return (
     <main style={{ background: "#070b14", minHeight: "100vh", paddingBottom: 90 }}>
       <div style={{ maxWidth: 1200, margin: "0 auto", padding: isMobile ? 12 : 16 }}>
-        {/* TOP BAR */}
         <div style={{ display: "flex", justifyContent: "space-between", gap: 12, alignItems: "center", marginBottom: 12, flexWrap: "wrap" }}>
           <div style={{ color: "white", fontSize: 28, fontWeight: 900 }}>Game</div>
 
@@ -86,13 +82,12 @@ export default function Page() {
           </div>
         </div>
 
-        {/* CARD */}
         <div style={card()}>
-          <GraphCanvas state={state} height={graphHeight} />
+          <GraphCanvas state={state} height={graphHeight} serverNow={serverNow} />
 
-          {/* HISTORY (как на примере) */}
+          {/* ИСТОРИЯ: новые СЛЕВА (history уже newest-first) */}
           <div style={{ marginTop: 12, display: "flex", gap: 8, overflowX: "auto", paddingBottom: 4 }}>
-            {[...history].reverse().map((h, idx) => {
+            {history.map((h, idx) => {
               const v = Number(h.v);
               const bg = v >= 0 ? "rgba(34,197,94,0.18)" : "rgba(239,68,68,0.18)";
               const bd = v >= 0 ? "rgba(34,197,94,0.35)" : "rgba(239,68,68,0.35)";
@@ -121,13 +116,11 @@ export default function Page() {
           </div>
         </div>
 
-        {/* DEBUG можно позже убрать */}
         <div style={{ marginTop: 10, color: "rgba(255,255,255,0.5)", fontSize: 12 }}>
           inside telegram: {isTelegram ? "YES" : "NO"} · phase: {state?.phase ?? "-"} · end: {typeof state?.endPercent === "number" ? `${state.endPercent.toFixed(0)}%` : "-"}
         </div>
       </div>
 
-      {/* BOTTOM BAR кнопок */}
       <div style={bottomBar()}>
         <button onClick={onDown} style={btnDown()}>Down</button>
         <button onClick={onUp} style={btnUp()}>Up</button>
@@ -216,7 +209,7 @@ function btnIns(): React.CSSProperties {
     height: 56,
     borderRadius: 16,
     border: "1px solid rgba(255,255,255,0.12)",
-    background: "rgba(168,85,247,0.70)", // фиолетовый
+    background: "rgba(168,85,247,0.70)",
     color: "#071018",
     fontWeight: 1000,
     cursor: "pointer",
