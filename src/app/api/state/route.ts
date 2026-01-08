@@ -12,24 +12,18 @@ type GameState = {
 };
 
 const KEY_STATE = "game:state";
-const KEY_HISTORY = "game:history"; // newest-first (LPUSH)
+const KEY_HISTORY = "game:history";
 
-// ✅ ЖЁСТКИЕ длительности (сек)
 const BET_MS = 7000;
-const PLAY_MS = 12000;
+const PLAY_MS = 15000; // ✅ 15 сек раунд
 const END_MS = 2500;
 
 const HISTORY_LIMIT = 50;
 
 function newRound(startAt: number): GameState {
-  return {
-    roundId: crypto.randomUUID(),
-    phase: "BET",
-    phaseStartedAt: startAt,
-  };
+  return { roundId: crypto.randomUUID(), phase: "BET", phaseStartedAt: startAt };
 }
 
-// Твои шансы (нормализация 40+10+3+50=103):
 function sampleEndPercent(): number {
   const r = Math.random();
   if (r < 0.5) return -100 + Math.random() * 100; // [-100..0]
@@ -48,7 +42,12 @@ async function ensureState(now: number) {
   const raw = await redis.get(KEY_STATE);
   let state: GameState = raw ? JSON.parse(raw) : newRound(now);
 
-  for (let i = 0; i < 80; i++) {
+  // ✅ если вдруг phaseStartedAt "в будущем" (клиент/сервер лагали) — чиним
+  if (state.phaseStartedAt > now + 2000) {
+    state.phaseStartedAt = now;
+  }
+
+  for (let i = 0; i < 120; i++) {
     const dur =
       state.phase === "BET" ? BET_MS :
       state.phase === "PLAY" ? PLAY_MS :
@@ -71,12 +70,7 @@ async function ensureState(now: number) {
     if (state.phase === "PLAY") {
       const endPercent = typeof state.endPercent === "number" ? state.endPercent : 0;
 
-      state = {
-        ...state,
-        phase: "END",
-        phaseStartedAt: phaseEndAt,
-        endPercent,
-      };
+      state = { ...state, phase: "END", phaseStartedAt: phaseEndAt, endPercent };
 
       await redis.lpush(KEY_HISTORY, JSON.stringify({ t: phaseEndAt, v: endPercent }));
       await redis.ltrim(KEY_HISTORY, 0, HISTORY_LIMIT - 1);
@@ -103,13 +97,7 @@ export async function GET() {
 
     return NextResponse.json({
       ok: true,
-      state: {
-        ...state,
-        // ✅ отдаём длительности всегда одинаково
-        betMs: BET_MS,
-        playMs: PLAY_MS,
-        endMs: END_MS,
-      },
+      state: { ...state, betMs: BET_MS, playMs: PLAY_MS, endMs: END_MS },
       history,
       serverNow: now,
     });
