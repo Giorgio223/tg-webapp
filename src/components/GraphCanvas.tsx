@@ -19,8 +19,8 @@ type Props = {
   state: GameState | null;
   height?: number;
   width?: number;
-  serverNowBase: number; // serverNow из /api/state
-  clientNowBase: number; // Date.now() в момент fetch
+  serverNowBase: number;
+  clientNowBase: number;
 };
 
 type Point = { t: number; v: number };
@@ -53,25 +53,36 @@ function smoothstep(x: number) {
   return t * t * (3 - 2 * t);
 }
 
+// детерминированные фазы
 function phaseFromSeed(seed: number, k: number) {
   const s = (seed * 9301 + 49297 + k * 233280) % 233280;
   return (s / 233280) * Math.PI * 2;
 }
 
-function fbm(t: number, seed: number) {
+function baseNoise(t: number, seed: number) {
   const p1 = phaseFromSeed(seed, 1);
   const p2 = phaseFromSeed(seed, 2);
   const p3 = phaseFromSeed(seed, 3);
   const p4 = phaseFromSeed(seed, 4);
   return (
-    Math.sin(t * 1.2 + p1) * 0.55 +
-    Math.sin(t * 2.3 + p2) * 0.25 +
-    Math.sin(t * 4.7 + p3) * 0.14 +
-    Math.sin(t * 7.9 + p4) * 0.06
+    Math.sin(t * 1.05 + p1) * 0.55 +
+    Math.sin(t * 2.05 + p2) * 0.28 +
+    Math.sin(t * 4.35 + p3) * 0.12 +
+    Math.sin(t * 7.10 + p4) * 0.05
   );
 }
 
-// PLAY: детерминированно, гладко, и всегда в конце = endPercent
+// редкие "удары" (но детерминированные по seed)
+function punch(t: number, seed: number) {
+  const p = phaseFromSeed(seed, 9);
+  // пилообразная огибающая: короткий "тычок"
+  const x = (t * 0.35 + p) % 1; // 0..1
+  const env = x < 0.06 ? (1 - x / 0.06) : 0; // быстрый спад
+  const dir = ((seed >> 5) & 1) ? 1 : -1;
+  return env * dir;
+}
+
+// PLAY: “живое” движение (детерминированно) + магнит к end
 function playValue(nowMs: number, state: GameState) {
   const seed = state.seed ?? 1337;
   const end = clamp(state.endPercent ?? 0, -100, 200);
@@ -82,33 +93,39 @@ function playValue(nowMs: number, state: GameState) {
   const mood = (seed % 1000) / 1000;
   const aggressive = mood < 0.40;
 
-  const mid = 1 - Math.abs(t01 * 2 - 1);
-  const ampBase = aggressive ? 55 : 38;
-  const amp = ampBase * (0.45 + mid * 0.75);
+  const mid = 1 - Math.abs(t01 * 2 - 1); // 0..1
+  const ampBase = aggressive ? 58 : 40;
+  const amp = ampBase * (0.40 + mid * 0.85);
 
-  const raw = fbm(t, seed) * amp;
+  const raw = baseNoise(t, seed) * amp;
 
-  const teaseW = smoothstep((t01 - 0.72) / 0.20) * (1 - smoothstep((t01 - 0.95) / 0.05));
-  const teaseDir = ((seed >> 4) & 1) ? 1 : -1;
-  const tease = teaseW * teaseDir * Math.sin(t * 5.2 + phaseFromSeed(seed, 7)) * (aggressive ? 14 : 9);
+  // "пошутить" иногда
+  const teaseW = smoothstep((t01 - 0.60) / 0.25) * (1 - smoothstep((t01 - 0.93) / 0.07));
+  const tease = teaseW * Math.sin(t * 5.0 + phaseFromSeed(seed, 7)) * (aggressive ? 16 : 10);
 
-  const noisy = clamp(raw + tease, -100, 200);
+  // редкие удары
+  const p = punch(t, seed) * (aggressive ? 22 : 14) * (0.35 + mid * 0.65);
 
-  const pull = smoothstep((t01 - 0.75) / 0.25);
+  const noisy = clamp(raw + tease + p, -100, 200);
+
+  // магнит в финале (последние 23%)
+  const pull = smoothstep((t01 - 0.77) / 0.23);
   const v = (1 - pull) * noisy + pull * end;
+
   return clamp(v, -100, 200);
 }
 
-// BET: строго ±10% (как ты просил)
+// BET: только ±10%
 function betValue(nowMs: number, state: GameState) {
   const seed = state.seed ?? 1337;
   const t = nowMs / 1000;
-  return clamp(fbm(t, seed) * 8.5, -10, 10);
+  return clamp(baseNoise(t, seed) * 8.5, -10, 10);
 }
 
 export default function GraphCanvas({ state, width, height = 480, serverNowBase, clientNowBase }: Props) {
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const historyRef = useRef<Point[]>([]);
+  const lastTRef = useRef<number>(0);
   const rafRef = useRef<number | null>(null);
   const scaleAlphaRef = useRef<number>(1);
 
@@ -144,7 +161,7 @@ export default function GraphCanvas({ state, width, height = 480, serverNowBase,
       const plotH = cssH - view.padT - view.padB;
       const plotR = plotL + plotW;
 
-      // ✅ стабильное “серверное” время без скачков
+      // ✅ монотонное “серверное” время
       const now = serverNowBase + (Date.now() - clientNowBase);
 
       const phase: Phase = (state?.phase ?? "BET") as Phase;
@@ -159,7 +176,12 @@ export default function GraphCanvas({ state, width, height = 480, serverNowBase,
       else if (phase === "PLAY") vNow = playValue(now, state);
       else vNow = clamp(state.endPercent ?? 0, -100, 200);
 
-      historyRef.current.push({ t: now, v: vNow });
+      // ✅ защита от телепорта (если вдруг now пошёл назад — не пишем в историю)
+      if (now >= lastTRef.current) {
+        historyRef.current.push({ t: now, v: vNow });
+        lastTRef.current = now;
+      }
+
       const cutoff = now - view.windowMs;
       while (historyRef.current.length > 2 && historyRef.current[0].t < cutoff) historyRef.current.shift();
 
@@ -168,7 +190,7 @@ export default function GraphCanvas({ state, width, height = 480, serverNowBase,
       ctx.fillStyle = "#0b1220";
       ctx.fillRect(0, 0, cssW, cssH);
 
-      // рамка plot
+      // рамка
       ctx.strokeStyle = "rgba(255,255,255,0.08)";
       ctx.lineWidth = 1;
       ctx.strokeRect(plotL, plotT, plotW, plotH);
@@ -185,7 +207,7 @@ export default function GraphCanvas({ state, width, height = 480, serverNowBase,
       ctx.stroke();
       ctx.restore();
 
-      // цвет
+      // цвет линии
       let lineColor = "rgba(255, 90, 90, 1)";
       if (vNow > 0) lineColor = "rgba(80, 220, 140, 1)";
       if (vNow > 110) lineColor = "rgba(255, 180, 60, 1)";
@@ -206,12 +228,24 @@ export default function GraphCanvas({ state, width, height = 480, serverNowBase,
       }
       ctx.stroke();
 
-      // кружок справа
+      // БЕЛЫЙ "БЛЕСТЯЩИЙ" кружок
       const xHead = plotR;
       const yHead = plotT + plotH / 2 - warpPercent(vNow) * (plotH * 0.46);
-      ctx.fillStyle = lineColor;
+
+      const g = ctx.createRadialGradient(xHead - 2, yHead - 2, 2, xHead, yHead, 10);
+      g.addColorStop(0, "rgba(255,255,255,1)");
+      g.addColorStop(0.45, "rgba(245,245,255,0.95)");
+      g.addColorStop(1, "rgba(200,200,220,0.25)");
+
+      ctx.fillStyle = g;
       ctx.beginPath();
-      ctx.arc(xHead, yHead, 5, 0, Math.PI * 2);
+      ctx.arc(xHead, yHead, 6, 0, Math.PI * 2);
+      ctx.fill();
+
+      // маленький блик
+      ctx.fillStyle = "rgba(255,255,255,0.85)";
+      ctx.beginPath();
+      ctx.arc(xHead - 2.5, yHead - 2.5, 1.7, 0, Math.PI * 2);
       ctx.fill();
 
       // бейдж % — не в BET
@@ -228,21 +262,16 @@ export default function GraphCanvas({ state, width, height = 480, serverNowBase,
         roundRect(ctx, bx, by, bw, bh, 14);
         ctx.fill();
 
-        ctx.fillStyle = lineColor;
-        ctx.beginPath();
-        ctx.arc(bx + 12, by + bh / 2, 4, 0, Math.PI * 2);
-        ctx.fill();
-
         ctx.fillStyle = "rgba(255,255,255,0.92)";
         ctx.textBaseline = "middle";
-        ctx.fillText(badgeText, bx + 22, by + bh / 2);
+        ctx.fillText(badgeText, bx + 14, by + bh / 2);
       }
 
-      // BET таймер-круг (и больше НЕ будет 99)
+      // BET таймер круг (если вдруг state кривой — remaining всё равно будет 0..7)
       if (state && phase === "BET") {
         const elapsed = now - state.phaseStartedAt;
         const t01 = clamp(elapsed / state.betMs, 0, 1);
-        const remaining = Math.max(0, Math.ceil((state.betMs - elapsed) / 1000)); // максимум 7 при betMs=7000
+        const remaining = clamp(Math.ceil((state.betMs - elapsed) / 1000), 0, Math.ceil(state.betMs / 1000));
 
         let col = "rgba(80, 220, 140, 0.95)";
         if (remaining <= 3) col = "rgba(255, 90, 90, 0.95)";
@@ -282,21 +311,11 @@ export default function GraphCanvas({ state, width, height = 480, serverNowBase,
         ctx.restore();
       }
 
-      // шкала справа
-      const must = [-100, -50, -10, 0, 10, 50, 100, 150, 200];
-      const items = must
+      // ✅ НОВАЯ ШКАЛА
+      const ticks = [-100, -80, -60, -40, -20, 0, 50, 150, 200];
+      const items = ticks
         .map((v) => ({ v, y: plotT + plotH / 2 - warpPercent(v) * (plotH * 0.46) }))
         .sort((a, b) => a.y - b.y);
-
-      const chosen: { v: number; y: number }[] = [];
-      const minGap = 14;
-      for (const it of items) {
-        const critical = it.v === -100 || it.v === 0 || it.v === 200;
-        const prev = chosen[chosen.length - 1];
-        if (!prev) chosen.push(it);
-        else if (it.y - prev.y >= minGap) chosen.push(it);
-        else if (critical) chosen[chosen.length - 1] = it;
-      }
 
       ctx.save();
       ctx.globalAlpha = scaleAlphaRef.current;
@@ -304,10 +323,11 @@ export default function GraphCanvas({ state, width, height = 480, serverNowBase,
       ctx.textAlign = "right";
       ctx.textBaseline = "middle";
 
-      for (const it of chosen) {
+      for (const it of items) {
         let c = "rgba(255,255,255,0.65)";
         if (it.v > 0) c = "rgba(80, 220, 140, 0.9)";
         if (it.v < 0) c = "rgba(255, 90, 90, 0.9)";
+        if (it.v === 0) c = "rgba(255,255,255,0.75)";
 
         ctx.fillStyle = c;
         ctx.fillText(`${it.v}%`, cssW - 12, it.y);

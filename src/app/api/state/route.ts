@@ -7,36 +7,29 @@ type GameState = {
   roundId: string;
   phase: Phase;
   phaseStartedAt: number;
-
   endPercent?: number;
   seed?: number;
-
-  betMs: number;
-  playMs: number;
-  endMs: number;
 };
 
 const KEY_STATE = "game:state";
 const KEY_HISTORY = "game:history"; // newest-first (LPUSH)
 
+// ✅ ЖЁСТКИЕ длительности (сек)
 const BET_MS = 7000;
 const PLAY_MS = 12000;
 const END_MS = 2500;
+
+const HISTORY_LIMIT = 50;
 
 function newRound(startAt: number): GameState {
   return {
     roundId: crypto.randomUUID(),
     phase: "BET",
     phaseStartedAt: startAt,
-    betMs: BET_MS,
-    playMs: PLAY_MS,
-    endMs: END_MS,
   };
 }
 
-// Твои шансы (нормализуем, т.к. 40+10+3+50=103):
-// 50%: -100..0
-// оставшиеся 50%: 0..50 (40/53), 51..150 (10/53), 150..200 (3/53)
+// Твои шансы (нормализация 40+10+3+50=103):
 function sampleEndPercent(): number {
   const r = Math.random();
   if (r < 0.5) return -100 + Math.random() * 100; // [-100..0]
@@ -50,30 +43,20 @@ function sampleEndPercent(): number {
   return 150 + Math.random() * 50;                    // 150..200
 }
 
-// Главная функция: догоняет состояние по серверному времени.
-// ВАЖНО: переходы ставим на момент окончания фазы, а не "now" — так у всех одинаково.
 async function ensureState(now: number) {
   const redis = getRedis();
   const raw = await redis.get(KEY_STATE);
   let state: GameState = raw ? JSON.parse(raw) : newRound(now);
 
-  // защитимся от слишком большого "догоняния" одним запросом
-  for (let i = 0; i < 50; i++) {
-    const betMs = state.betMs ?? BET_MS;
-    const playMs = state.playMs ?? PLAY_MS;
-    const endMs = state.endMs ?? END_MS;
+  for (let i = 0; i < 80; i++) {
+    const dur =
+      state.phase === "BET" ? BET_MS :
+      state.phase === "PLAY" ? PLAY_MS :
+      END_MS;
 
-    const phaseDur =
-      state.phase === "BET" ? betMs :
-      state.phase === "PLAY" ? playMs :
-      endMs;
-
-    const phaseEndAt = state.phaseStartedAt + phaseDur;
-
-    // если ещё не закончилась текущая фаза — готово
+    const phaseEndAt = state.phaseStartedAt + dur;
     if (now < phaseEndAt) break;
 
-    // иначе переходим в следующую фазу (в момент phaseEndAt)
     if (state.phase === "BET") {
       state = {
         ...state,
@@ -88,7 +71,6 @@ async function ensureState(now: number) {
     if (state.phase === "PLAY") {
       const endPercent = typeof state.endPercent === "number" ? state.endPercent : 0;
 
-      // фиксируем END
       state = {
         ...state,
         phase: "END",
@@ -96,23 +78,20 @@ async function ensureState(now: number) {
         endPercent,
       };
 
-      // добавляем в историю (newest-first)
       await redis.lpush(KEY_HISTORY, JSON.stringify({ t: phaseEndAt, v: endPercent }));
-      await redis.ltrim(KEY_HISTORY, 0, 11);
-
+      await redis.ltrim(KEY_HISTORY, 0, HISTORY_LIMIT - 1);
       continue;
     }
 
-    // END -> новый раунд BET
     state = newRound(phaseEndAt);
   }
 
   await redis.set(KEY_STATE, JSON.stringify(state));
 
-  const histRaw = await redis.lrange(KEY_HISTORY, 0, 11);
-  const history = histRaw.map((x) => {
-    try { return JSON.parse(x); } catch { return null; }
-  }).filter(Boolean);
+  const histRaw = await redis.lrange(KEY_HISTORY, 0, HISTORY_LIMIT - 1);
+  const history = histRaw
+    .map((x) => { try { return JSON.parse(x); } catch { return null; } })
+    .filter(Boolean);
 
   return { state, history };
 }
@@ -121,7 +100,19 @@ export async function GET() {
   try {
     const now = Date.now();
     const { state, history } = await ensureState(now);
-    return NextResponse.json({ ok: true, state, history, serverNow: now });
+
+    return NextResponse.json({
+      ok: true,
+      state: {
+        ...state,
+        // ✅ отдаём длительности всегда одинаково
+        betMs: BET_MS,
+        playMs: PLAY_MS,
+        endMs: END_MS,
+      },
+      history,
+      serverNow: now,
+    });
   } catch (e: any) {
     return NextResponse.json({ ok: false, error: e?.message ?? String(e) }, { status: 500 });
   }
