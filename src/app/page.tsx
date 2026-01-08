@@ -26,7 +26,10 @@ export default function Page() {
   const [isTelegram, setIsTelegram] = useState(false);
   const [state, setState] = useState<GameState | null>(null);
   const [history, setHistory] = useState<HistItem[]>([]);
-  const [serverNow, setServerNow] = useState<number>(Date.now());
+
+  // ✅ для идеальной синхры времени
+  const [serverNowBase, setServerNowBase] = useState<number>(Date.now());
+  const [clientNowBase, setClientNowBase] = useState<number>(Date.now());
 
   const [balance] = useState<number>(0);
 
@@ -34,12 +37,16 @@ export default function Page() {
   const graphHeight = useMemo(() => (isMobile ? 360 : 460), [isMobile]);
 
   async function refresh() {
+    const clientNow = Date.now();
     const r = await fetch("/api/state", { cache: "no-store" });
     const j = await r.json();
     if (j.ok) {
       setState(j.state);
       setHistory(j.history ?? []);
-      setServerNow(j.serverNow ?? Date.now());
+
+      // ✅ фиксируем пару (serverNow, clientNow) в момент получения
+      setServerNowBase(j.serverNow ?? clientNow);
+      setClientNowBase(clientNow);
     }
   }
 
@@ -52,7 +59,6 @@ export default function Page() {
     }
 
     refresh();
-    // 2 раза в секунду достаточно, а график сам плавно рисуется 60fps
     const id = setInterval(() => refresh(), 500);
     return () => clearInterval(id);
   }, []);
@@ -83,9 +89,14 @@ export default function Page() {
         </div>
 
         <div style={card()}>
-          <GraphCanvas state={state} height={graphHeight} serverNow={serverNow} />
+          <GraphCanvas
+            state={state}
+            height={graphHeight}
+            serverNowBase={serverNowBase}
+            clientNowBase={clientNowBase}
+          />
 
-          {/* ИСТОРИЯ: новые СЛЕВА (history уже newest-first) */}
+          {/* История: новые слева (newest-first) */}
           <div style={{ marginTop: 12, display: "flex", gap: 8, overflowX: "auto", paddingBottom: 4 }}>
             {history.map((h, idx) => {
               const v = Number(h.v);
@@ -93,17 +104,20 @@ export default function Page() {
               const bd = v >= 0 ? "rgba(34,197,94,0.35)" : "rgba(239,68,68,0.35)";
               const col = v >= 0 ? "rgba(80,220,140,0.95)" : "rgba(255,90,90,0.95)";
               return (
-                <div key={idx} style={{
-                  minWidth: 72,
-                  padding: "8px 10px",
-                  borderRadius: 12,
-                  background: bg,
-                  border: `1px solid ${bd}`,
-                  color: col,
-                  fontWeight: 900,
-                  textAlign: "center",
-                  whiteSpace: "nowrap"
-                }}>
+                <div
+                  key={idx}
+                  style={{
+                    minWidth: 72,
+                    padding: "8px 10px",
+                    borderRadius: 12,
+                    background: bg,
+                    border: `1px solid ${bd}`,
+                    color: col,
+                    fontWeight: 900,
+                    textAlign: "center",
+                    whiteSpace: "nowrap",
+                  }}
+                >
                   {v.toFixed(0)}%
                 </div>
               );

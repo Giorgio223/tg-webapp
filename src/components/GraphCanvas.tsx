@@ -19,7 +19,8 @@ type Props = {
   state: GameState | null;
   height?: number;
   width?: number;
-  serverNow: number; // серверное время из /api/state
+  serverNowBase: number; // serverNow из /api/state
+  clientNowBase: number; // Date.now() в момент fetch
 };
 
 type Point = { t: number; v: number };
@@ -52,19 +53,16 @@ function smoothstep(x: number) {
   return t * t * (3 - 2 * t);
 }
 
-// детерминированные “фазы” для синусов из seed
 function phaseFromSeed(seed: number, k: number) {
   const s = (seed * 9301 + 49297 + k * 233280) % 233280;
   return (s / 233280) * Math.PI * 2;
 }
 
 function fbm(t: number, seed: number) {
-  // fBm на синусах — детерминированно, гладко, “живее” чем 1 синус
   const p1 = phaseFromSeed(seed, 1);
   const p2 = phaseFromSeed(seed, 2);
   const p3 = phaseFromSeed(seed, 3);
   const p4 = phaseFromSeed(seed, 4);
-
   return (
     Math.sin(t * 1.2 + p1) * 0.55 +
     Math.sin(t * 2.3 + p2) * 0.25 +
@@ -73,7 +71,7 @@ function fbm(t: number, seed: number) {
   );
 }
 
-// PLAY траектория: “рандомное” движение + магнит к end в конце
+// PLAY: детерминированно, гладко, и всегда в конце = endPercent
 function playValue(nowMs: number, state: GameState) {
   const seed = state.seed ?? 1337;
   const end = clamp(state.endPercent ?? 0, -100, 200);
@@ -81,49 +79,40 @@ function playValue(nowMs: number, state: GameState) {
   const t01 = clamp((nowMs - state.phaseStartedAt) / state.playMs, 0, 1);
   const t = (nowMs - state.phaseStartedAt) / 1000;
 
-  // характер (иногда спокойнее/иногда резче) — но у всех одинаково, т.к. зависит от seed
   const mood = (seed % 1000) / 1000;
   const aggressive = mood < 0.40;
 
-  // амплитуда “жизни”: больше в середине, меньше к концу
-  const mid = 1 - Math.abs(t01 * 2 - 1); // 0..1
+  const mid = 1 - Math.abs(t01 * 2 - 1);
   const ampBase = aggressive ? 55 : 38;
   const amp = ampBase * (0.45 + mid * 0.75);
 
-  // основной шум
   const raw = fbm(t, seed) * amp;
 
-  // “подшутить под конец” — небольшой разворот, который пропадает в финале
   const teaseW = smoothstep((t01 - 0.72) / 0.20) * (1 - smoothstep((t01 - 0.95) / 0.05));
   const teaseDir = ((seed >> 4) & 1) ? 1 : -1;
   const tease = teaseW * teaseDir * Math.sin(t * 5.2 + phaseFromSeed(seed, 7)) * (aggressive ? 14 : 9);
 
   const noisy = clamp(raw + tease, -100, 200);
 
-  // магнит к концу: последние 25%
   const pull = smoothstep((t01 - 0.75) / 0.25);
-
-  // итог: сначала почти noisy, к концу — end
   const v = (1 - pull) * noisy + pull * end;
   return clamp(v, -100, 200);
 }
 
+// BET: строго ±10% (как ты просил)
 function betValue(nowMs: number, state: GameState) {
   const seed = state.seed ?? 1337;
   const t = nowMs / 1000;
-  // строго в ±10%
   return clamp(fbm(t, seed) * 8.5, -10, 10);
 }
 
-export default function GraphCanvas({ state, width, height = 480, serverNow }: Props) {
+export default function GraphCanvas({ state, width, height = 480, serverNowBase, clientNowBase }: Props) {
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const historyRef = useRef<Point[]>([]);
   const rafRef = useRef<number | null>(null);
   const scaleAlphaRef = useRef<number>(1);
 
-  const view = useMemo(() => {
-    return { windowMs: 26000, padL: 18, padR: 90, padT: 18, padB: 26 };
-  }, []);
+  const view = useMemo(() => ({ windowMs: 26000, padL: 18, padR: 90, padT: 18, padB: 26 }), []);
 
   useEffect(() => {
     const canvas = canvasRef.current;
@@ -132,14 +121,6 @@ export default function GraphCanvas({ state, width, height = 480, serverNow }: P
     if (!ctx) return;
 
     let last = performance.now();
-    let localServerOffset = 0;
-
-    // подтягиваем локальный offset к serverNow (чтобы таймер не улетал при лагах)
-    const syncServerClock = () => {
-      const clientNow = Date.now();
-      localServerOffset = serverNow - clientNow;
-    };
-    syncServerClock();
 
     const draw = (ts: number) => {
       const dt = ts - last;
@@ -162,10 +143,9 @@ export default function GraphCanvas({ state, width, height = 480, serverNow }: P
       const plotW = cssW - view.padL - view.padR;
       const plotH = cssH - view.padT - view.padB;
       const plotR = plotL + plotW;
-      const plotB = plotT + plotH;
 
-      // берём "серверное" текущее время
-      const now = Date.now() + localServerOffset;
+      // ✅ стабильное “серверное” время без скачков
+      const now = serverNowBase + (Date.now() - clientNowBase);
 
       const phase: Phase = (state?.phase ?? "BET") as Phase;
 
@@ -174,18 +154,11 @@ export default function GraphCanvas({ state, width, height = 480, serverNow }: P
       scaleAlphaRef.current = scaleAlphaRef.current + ((showScale ? 1 : 0) - scaleAlphaRef.current) * (0.10 * k);
 
       let vNow = 0;
+      if (!state) vNow = 0;
+      else if (phase === "BET") vNow = betValue(now, state);
+      else if (phase === "PLAY") vNow = playValue(now, state);
+      else vNow = clamp(state.endPercent ?? 0, -100, 200);
 
-      if (!state) {
-        vNow = 0;
-      } else if (phase === "BET") {
-        vNow = betValue(now, state);
-      } else if (phase === "PLAY") {
-        vNow = playValue(now, state);
-      } else {
-        vNow = clamp(state.endPercent ?? 0, -100, 200);
-      }
-
-      // история линии
       historyRef.current.push({ t: now, v: vNow });
       const cutoff = now - view.windowMs;
       while (historyRef.current.length > 2 && historyRef.current[0].t < cutoff) historyRef.current.shift();
@@ -195,6 +168,7 @@ export default function GraphCanvas({ state, width, height = 480, serverNow }: P
       ctx.fillStyle = "#0b1220";
       ctx.fillRect(0, 0, cssW, cssH);
 
+      // рамка plot
       ctx.strokeStyle = "rgba(255,255,255,0.08)";
       ctx.lineWidth = 1;
       ctx.strokeRect(plotL, plotT, plotW, plotH);
@@ -211,7 +185,7 @@ export default function GraphCanvas({ state, width, height = 480, serverNow }: P
       ctx.stroke();
       ctx.restore();
 
-      // цвет линии
+      // цвет
       let lineColor = "rgba(255, 90, 90, 1)";
       if (vNow > 0) lineColor = "rgba(80, 220, 140, 1)";
       if (vNow > 110) lineColor = "rgba(255, 180, 60, 1)";
@@ -240,7 +214,7 @@ export default function GraphCanvas({ state, width, height = 480, serverNow }: P
       ctx.arc(xHead, yHead, 5, 0, Math.PI * 2);
       ctx.fill();
 
-      // бейдж % (только не в BET)
+      // бейдж % — не в BET
       if (phase !== "BET") {
         const badgeText = `${vNow.toFixed(0)}%`;
         ctx.font = "14px system-ui";
@@ -264,11 +238,11 @@ export default function GraphCanvas({ state, width, height = 480, serverNow }: P
         ctx.fillText(badgeText, bx + 22, by + bh / 2);
       }
 
-      // BET таймер-круг по центру
+      // BET таймер-круг (и больше НЕ будет 99)
       if (state && phase === "BET") {
         const elapsed = now - state.phaseStartedAt;
         const t01 = clamp(elapsed / state.betMs, 0, 1);
-        const remaining = Math.max(0, Math.min(99, Math.ceil((state.betMs - elapsed) / 1000))); // не улетит в 130
+        const remaining = Math.max(0, Math.ceil((state.betMs - elapsed) / 1000)); // максимум 7 при betMs=7000
 
         let col = "rgba(80, 220, 140, 0.95)";
         if (remaining <= 3) col = "rgba(255, 90, 90, 0.95)";
@@ -308,7 +282,7 @@ export default function GraphCanvas({ state, width, height = 480, serverNow }: P
         ctx.restore();
       }
 
-      // шкала справа (ключевые метки)
+      // шкала справа
       const must = [-100, -50, -10, 0, 10, 50, 100, 150, 200];
       const items = must
         .map((v) => ({ v, y: plotT + plotH / 2 - warpPercent(v) * (plotH * 0.46) }))
@@ -316,7 +290,6 @@ export default function GraphCanvas({ state, width, height = 480, serverNow }: P
 
       const chosen: { v: number; y: number }[] = [];
       const minGap = 14;
-
       for (const it of items) {
         const critical = it.v === -100 || it.v === 0 || it.v === 200;
         const prev = chosen[chosen.length - 1];
@@ -351,9 +324,6 @@ export default function GraphCanvas({ state, width, height = 480, serverNow }: P
       ctx.fillStyle = "rgba(255,255,255,0.6)";
       ctx.fillText(phase, plotL, cssH - 10);
 
-      // иногда ресинхроним offset (чтобы не уплыло)
-      if (Math.random() < 0.01) syncServerClock();
-
       rafRef.current = requestAnimationFrame(draw);
     };
 
@@ -362,7 +332,7 @@ export default function GraphCanvas({ state, width, height = 480, serverNow }: P
       if (rafRef.current) cancelAnimationFrame(rafRef.current);
       rafRef.current = null;
     };
-  }, [height, width, view.padB, view.padL, view.padR, view.padT, view.windowMs, state?.roundId, state?.phase, serverNow]);
+  }, [height, width, view.padB, view.padL, view.padR, view.padT, view.windowMs, state?.roundId, state?.phase, serverNowBase, clientNowBase]);
 
   return (
     <canvas
