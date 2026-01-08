@@ -9,39 +9,25 @@ export type GameState = {
   phase: Phase;
   phaseStartedAt: number;
   endPercent?: number;
-  seed: number;
+  seed?: number;
   betMs: number;
   playMs: number;
   endMs: number;
 };
 
-export type RoundMeta = {
-  roundId: string;
-  playStartedAt: number;
-  endPercent: number;
-  seed: number;
-};
-
 type Props = {
   state: GameState | null;
-  rounds: RoundMeta[];
   height?: number;
   width?: number;
-  serverNowBase: number;
-  clientNowBase: number;
+  serverNowBase: number; // serverNow из /api/state
+  clientNowBase: number; // Date.now() в момент fetch
 };
 
-type Point = { t: number; v: number };
-
 const clamp = (x: number, a: number, b: number) => Math.max(a, Math.min(b, x));
-
-function warpPercent(p: number) {
-  const x = clamp(p, -100, 200);
-  const k = x >= 0 ? 18 : 22;
-  const w = Math.tanh(x / k);
-  const gamma = 0.85;
-  return Math.sign(w) * Math.pow(Math.abs(w), gamma);
-}
+const smoothstep = (x: number) => {
+  const t = clamp(x, 0, 1);
+  return t * t * (3 - 2 * t);
+};
 
 function roundRect(ctx: CanvasRenderingContext2D, x: number, y: number, w: number, h: number, r: number) {
   const rr = Math.min(r, w / 2, h / 2);
@@ -54,21 +40,28 @@ function roundRect(ctx: CanvasRenderingContext2D, x: number, y: number, w: numbe
   ctx.closePath();
 }
 
-const smoothstep = (x: number) => {
-  const t = clamp(x, 0, 1);
-  return t * t * (3 - 2 * t);
-};
+function warpPercent(p: number) {
+  // Важно: работаем в диапазоне [-100..200]
+  const x = clamp(p, -100, 200);
+  // Лёгкая компрессия, чтобы визуально было похоже на “казино график”
+  const k = x >= 0 ? 18 : 22;
+  const w = Math.tanh(x / k);
+  const gamma = 0.85;
+  return Math.sign(w) * Math.pow(Math.abs(w), gamma);
+}
 
-function phaseFromSeed(seed: number, k: number) {
+// детерминированные фазы от seed
+function ph(seed: number, k: number) {
   const s = (seed * 9301 + 49297 + k * 233280) % 233280;
   return (s / 233280) * Math.PI * 2;
 }
 
-function noise(t: number, seed: number) {
-  const p1 = phaseFromSeed(seed, 1);
-  const p2 = phaseFromSeed(seed, 2);
-  const p3 = phaseFromSeed(seed, 3);
-  const p4 = phaseFromSeed(seed, 4);
+// живой шум (детерминированный)
+function n1(t: number, seed: number) {
+  const p1 = ph(seed, 1);
+  const p2 = ph(seed, 2);
+  const p3 = ph(seed, 3);
+  const p4 = ph(seed, 4);
   return (
     Math.sin(t * 0.95 + p1) * 0.55 +
     Math.sin(t * 1.90 + p2) * 0.28 +
@@ -77,128 +70,107 @@ function noise(t: number, seed: number) {
   );
 }
 
+// редкий импульс (как “подшутить”)
 function punch(t: number, seed: number) {
-  const p = phaseFromSeed(seed, 9);
+  const p = ph(seed, 9);
   const x = (t * 0.33 + p) % 1;
   const env = x < 0.07 ? (1 - x / 0.07) : 0;
   const dir = ((seed >> 5) & 1) ? 1 : -1;
   return env * dir;
 }
 
-function betPure(nowMs: number, seed: number) {
-  const t = nowMs / 1000;
-  return clamp(noise(t, seed) * 8.5, -10, 10);
-}
+function valueAt(ms: number, s: GameState) {
+  const seed = s.seed ?? 1337;
+  const phase = s.phase;
+  const tGlobal = ms / 1000;
 
-function playValueAt(nowMs: number, playStartedAt: number, playMs: number, seed: number, endPercent: number) {
-  const end = clamp(endPercent, -100, 200);
-  const t01 = clamp((nowMs - playStartedAt) / playMs, 0, 1);
-  const t = (nowMs - playStartedAt) / 1000;
+  if (phase === "END") return clamp(s.endPercent ?? 0, -100, 200);
 
+  if (phase === "BET") {
+    // ✅ BET колышется в ±10, без резких прыжков
+    const t = (ms - s.phaseStartedAt) / 1000;
+    const v = n1(tGlobal, seed) * 8.5;
+    // легкое “затухание” в начале BET (чтобы не было скачка после END)
+    const w = smoothstep(t / 0.9);
+    return clamp(v * w, -10, 10);
+  }
+
+  // PLAY
+  const end = clamp(s.endPercent ?? 0, -100, 200);
+  const t01 = clamp((ms - s.phaseStartedAt) / s.playMs, 0, 1);
+  const t = (ms - s.phaseStartedAt) / 1000;
+
+  // “настроение” (агрессия/мягкость) детерминировано от seed
   const mood = (seed % 1000) / 1000;
   const aggressive = mood < 0.45;
 
   const mid = 1 - Math.abs(t01 * 2 - 1);
   const ampBase = aggressive ? 60 : 42;
-  const amp = ampBase * (0.45 + mid * 0.90);
+  const amp = ampBase * (0.45 + mid * 0.95);
 
-  const raw = noise(t, seed) * amp;
+  const raw = n1(tGlobal, seed) * amp;
 
   const teaseW = smoothstep((t01 - 0.55) / 0.25) * (1 - smoothstep((t01 - 0.93) / 0.07));
   const teaseDir = ((seed >> 7) & 1) ? 1 : -1;
-  const tease = teaseW * teaseDir * Math.sin(t * 4.8 + phaseFromSeed(seed, 7)) * (aggressive ? 16 : 11);
+  const tease = teaseW * teaseDir * Math.sin(t * 4.8 + ph(seed, 7)) * (aggressive ? 16 : 11);
 
   const hit = punch(t, seed) * (aggressive ? 22 : 14) * (0.35 + mid * 0.65);
 
   const noisy = clamp(raw + tease + hit, -100, 200);
 
+  // ✅ магнит к endPercent ближе к концу (без телепорта)
   const pull = smoothstep((t01 - 0.78) / 0.22);
   return clamp((1 - pull) * noisy + pull * end, -100, 200);
 }
 
-export default function GraphCanvas({ state, rounds, width, height = 520, serverNowBase, clientNowBase }: Props) {
+export default function GraphCanvas({ state, width, height = 520, serverNowBase, clientNowBase }: Props) {
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
 
-  const historyRef = useRef<Point[]>([]);
-  const lastTRef = useRef<number>(0);
+  // ✅ монотонное время (убирает микродёрги iOS)
+  const monoStartPerf = useRef<number>(performance.now());
+  const monoStartReal = useRef<number>(Date.now());
 
-  // монотонное время
-  const monoStartPerfRef = useRef<number>(performance.now());
-  const monoStartRealRef = useRef<number>(Date.now());
-
-  // offset сглаженный
+  // ✅ мягкий offset (serverNow - clientNow)
   const offsetRef = useRef<number>(0);
 
-  // камера
-  const cameraEndXRatio = 0.85;
+  // показывать шкалу плавно (BET скрываем)
+  const scaleAlpha = useRef<number>(1);
 
-  // шкала плавно
-  const scaleAlphaRef = useRef<number>(1);
-
-  // ✅ slew-rate (ограничение скорости, убирает “стенки”)
-  const smoothVRef = useRef<number>(0);
-
-  // ✅ soft landing в BET (НЕ зависит от phaseStartedAt)
-  const phaseRef = useRef<Phase>("BET");
-  const betLandingRef = useRef<{ active: boolean; startMs: number; startV: number; durMs: number }>({
-    active: false,
-    startMs: 0,
-    startV: 0,
-    durMs: 2200,
-  });
-
-  // ✅ чтобы один раз предзаполнить путь прошлыми раундами
-  const prefillDoneRef = useRef(false);
-
-  const view = useMemo(() => ({ windowMs: 26000, padL: 18, padR: 90, padT: 18, padB: 26 }), []);
-
-  useEffect(() => {
-    // ✅ предзаполнение прошлыми раундами, чтобы новый юзер видел “как было”
-    if (prefillDoneRef.current) return;
-    if (!rounds || rounds.length === 0) return;
-
-    // рисуем от старых к новым
-    const ordered = [...rounds].reverse();
-    const pts: Point[] = [];
-    const stepMs = 140; // достаточно гладко
-
-    for (const r of ordered) {
-      const start = r.playStartedAt;
-      const end = r.playStartedAt + 15000;
-
-      for (let t = start; t <= end; t += stepMs) {
-        const v = playValueAt(t, start, 15000, r.seed, r.endPercent);
-        pts.push({ t, v });
-      }
-    }
-
-    if (pts.length) {
-      historyRef.current = pts;
-      lastTRef.current = pts[pts.length - 1].t;
-      smoothVRef.current = pts[pts.length - 1].v;
-      prefillDoneRef.current = true;
-    }
-  }, [rounds]);
+  const view = useMemo(
+    () => ({
+      padL: 18,
+      padR: 90,
+      padT: 18,
+      padB: 26,
+      windowMs: 26000,
+      headXRatio: 0.85,
+      samples: 260, // ✅ фикс. число точек, нет накопления => нет “столбов”
+    }),
+    []
+  );
 
   useEffect(() => {
     const canvas = canvasRef.current;
     if (!canvas) return;
+
     const ctx = canvas.getContext("2d");
     if (!ctx) return;
 
     let last = performance.now();
+    let raf = 0;
 
-    const draw = () => {
-      const ts = performance.now();
-      const dt = ts - last;
-      last = ts;
-      const kdt = clamp(dt / 16.7, 0.5, 2.2);
+    const frame = () => {
+      const nowPerf = performance.now();
+      const dt = nowPerf - last;
+      last = nowPerf;
+      const kdt = clamp(dt / 16.7, 0.6, 2.5);
 
-      const monoNow = monoStartRealRef.current + (performance.now() - monoStartPerfRef.current);
+      // монотонный now
+      const monoNow = monoStartReal.current + (performance.now() - monoStartPerf.current);
+
+      // подтяжка offset
       const targetOffset = serverNowBase - clientNowBase;
-
-      // мягкая подтяжка offset
-      const maxStep = 16 * kdt;
+      const maxStep = 18 * kdt;
       const diff = targetOffset - offsetRef.current;
       offsetRef.current += clamp(diff, -maxStep, maxStep);
 
@@ -222,76 +194,6 @@ export default function GraphCanvas({ state, rounds, width, height = 520, server
       const plotH = Math.max(1, cssH - view.padT - view.padB);
       const plotR = plotL + plotW;
 
-      const phase: Phase = (state?.phase ?? "BET") as Phase;
-
-      // переход в BET — включаем soft landing
-      if (phaseRef.current !== phase) {
-        if (phase === "BET") {
-          betLandingRef.current = {
-            active: true,
-            startMs: now,
-            startV: smoothVRef.current,
-            durMs: 2200,
-          };
-        }
-        phaseRef.current = phase;
-      }
-
-      const showScale = phase !== "BET";
-      scaleAlphaRef.current += ((showScale ? 1 : 0) - scaleAlphaRef.current) * (0.10 * kdt);
-
-      // сырой v
-      let vRaw = 0;
-
-      if (!state) {
-        vRaw = 0;
-      } else if (phase === "BET") {
-        const target = betPure(now, state.seed);
-
-        if (betLandingRef.current.active) {
-          const t01 = clamp((now - betLandingRef.current.startMs) / betLandingRef.current.durMs, 0, 1);
-          const w = smoothstep(t01);
-          vRaw = (1 - w) * betLandingRef.current.startV + w * target;
-          if (t01 >= 1) betLandingRef.current.active = false;
-        } else {
-          vRaw = target;
-        }
-      } else if (phase === "PLAY") {
-        const endP = typeof state.endPercent === "number" ? state.endPercent : 0;
-        vRaw = playValueAt(now, state.phaseStartedAt, state.playMs, state.seed, endP);
-      } else {
-        vRaw = clamp(state.endPercent ?? 0, -100, 200);
-      }
-
-      // ✅ ограничение скорости (убирает “стенки/телепорты”)
-      const maxPerSecBase = phase === "PLAY" ? 140 : 55; // %/sec
-      // ближе к концу PLAY — разрешаем быстрее, чтобы точно попасть в endPercent
-      let extra = 0;
-      if (phase === "PLAY" && state) {
-        const t01 = clamp((now - state.phaseStartedAt) / state.playMs, 0, 1);
-        extra = smoothstep((t01 - 0.78) / 0.22) * 220; // ускорение к финалу
-      }
-      const maxStepV = ((maxPerSecBase + extra) * dt) / 1000;
-      const dv = vRaw - smoothVRef.current;
-      smoothVRef.current += clamp(dv, -maxStepV, maxStepV);
-
-      const vNow = clamp(smoothVRef.current, -100, 200);
-
-      // пушим в историю
-      if (now >= lastTRef.current) {
-        historyRef.current.push({ t: now, v: vNow });
-        lastTRef.current = now;
-      }
-
-      // окно камеры
-      const windowMs = view.windowMs;
-      const windowStart = now - windowMs * cameraEndXRatio;
-
-      // чистка
-      const cutoff = windowStart - 2500;
-      while (historyRef.current.length > 2 && historyRef.current[0].t < cutoff) historyRef.current.shift();
-
-      // рисование фона
       ctx.clearRect(0, 0, cssW, cssH);
       ctx.fillStyle = "#0b1220";
       ctx.fillRect(0, 0, cssW, cssH);
@@ -301,37 +203,53 @@ export default function GraphCanvas({ state, rounds, width, height = 520, server
       ctx.lineWidth = 1;
       ctx.strokeRect(plotL, plotT, plotW, plotH);
 
-      // 0%
+      // 0 dashed
       const yZero = plotT + plotH / 2;
       ctx.save();
       ctx.setLineDash([6, 6]);
       ctx.strokeStyle = "rgba(255,255,255,0.25)";
-      ctx.lineWidth = 1;
       ctx.beginPath();
       ctx.moveTo(plotL, yZero);
       ctx.lineTo(plotR, yZero);
       ctx.stroke();
       ctx.restore();
 
+      if (!state) {
+        raf = requestAnimationFrame(frame);
+        return;
+      }
+
+      const phase = state.phase;
+      const vNow = valueAt(now, state);
+
+      // шкала fade (BET скрываем)
+      const showScale = phase !== "BET";
+      scaleAlpha.current += ((showScale ? 1 : 0) - scaleAlpha.current) * (0.12 * kdt);
+
       // цвет линии
       let lineColor = "rgba(255, 90, 90, 1)";
       if (vNow > 0) lineColor = "rgba(80, 220, 140, 1)";
       if (vNow > 110) lineColor = "rgba(255, 180, 60, 1)";
 
-      const hist = historyRef.current;
+      // ✅ камера/окно: наконечник на 85% ширины
+      const windowStart = now - view.windowMs * view.headXRatio;
 
-      // линия + glow
+      // ✅ рисуем линию фиксированным числом точек (нет накопления => нет столбов)
+      const samples = view.samples;
+      const step = view.windowMs / (samples - 1);
+
       ctx.save();
       ctx.shadowColor = lineColor;
       ctx.shadowBlur = 14;
-      ctx.lineWidth = 3.2;
       ctx.strokeStyle = lineColor;
+      ctx.lineWidth = 3.2;
 
       ctx.beginPath();
-      for (let i = 0; i < hist.length; i++) {
-        const p = hist[i];
-        const x = plotL + ((p.t - windowStart) / windowMs) * plotW;
-        const y = plotT + plotH / 2 - warpPercent(p.v) * (plotH * 0.46);
+      for (let i = 0; i < samples; i++) {
+        const tMs = windowStart + i * step;
+        const v = valueAt(tMs, state);
+        const x = plotL + (i / (samples - 1)) * plotW;
+        const y = plotT + plotH / 2 - warpPercent(v) * (plotH * 0.46);
         if (i === 0) ctx.moveTo(x, y);
         else ctx.lineTo(x, y);
       }
@@ -339,10 +257,10 @@ export default function GraphCanvas({ state, rounds, width, height = 520, server
       ctx.restore();
 
       // наконечник
-      const xHead = plotL + ((now - windowStart) / windowMs) * plotW;
+      const xHead = plotL + ((now - windowStart) / view.windowMs) * plotW;
       const yHead = plotT + plotH / 2 - warpPercent(vNow) * (plotH * 0.46);
 
-      // ореол
+      // белый ореол “баллончиком”
       ctx.save();
       ctx.globalAlpha = 0.38;
       const halo = ctx.createRadialGradient(xHead, yHead, 2, xHead, yHead, 28);
@@ -354,7 +272,7 @@ export default function GraphCanvas({ state, rounds, width, height = 520, server
       ctx.fill();
       ctx.restore();
 
-      // шар
+      // белый шар
       const g = ctx.createRadialGradient(xHead - 2, yHead - 2, 2, xHead, yHead, 10);
       g.addColorStop(0, "rgba(255,255,255,1)");
       g.addColorStop(0.55, "rgba(248,248,255,0.95)");
@@ -370,7 +288,7 @@ export default function GraphCanvas({ state, rounds, width, height = 520, server
       ctx.arc(xHead - 2.6, yHead - 2.6, 1.8, 0, Math.PI * 2);
       ctx.fill();
 
-      // бейдж % — не в BET
+      // бейдж % — только не в BET
       if (phase !== "BET") {
         const badgeText = `${vNow.toFixed(0)}%`;
         ctx.font = "14px system-ui";
@@ -389,8 +307,8 @@ export default function GraphCanvas({ state, rounds, width, height = 520, server
         ctx.fillText(badgeText, bx + 14, by + bh / 2);
       }
 
-      // BET таймер
-      if (state && phase === "BET") {
+      // BET таймер (7 сек), зел->желт->красн
+      if (phase === "BET") {
         const elapsed = now - state.phaseStartedAt;
         const t01 = clamp(elapsed / state.betMs, 0, 1);
         const maxSec = Math.max(1, Math.ceil(state.betMs / 1000));
@@ -434,10 +352,10 @@ export default function GraphCanvas({ state, rounds, width, height = 520, server
         ctx.restore();
       }
 
-      // шкала
+      // шкала (BET скрыта)
       const ticks = [-100, -80, -60, -40, -20, 0, 50, 150, 200];
       ctx.save();
-      ctx.globalAlpha = scaleAlphaRef.current;
+      ctx.globalAlpha = scaleAlpha.current;
       ctx.font = "12px system-ui";
       ctx.textAlign = "right";
       ctx.textBaseline = "middle";
@@ -460,15 +378,17 @@ export default function GraphCanvas({ state, rounds, width, height = 520, server
       }
       ctx.restore();
 
+      // подпись фазы
       ctx.font = "12px system-ui";
       ctx.fillStyle = "rgba(255,255,255,0.6)";
       ctx.fillText(phase, plotL, cssH - 10);
 
-      requestAnimationFrame(draw);
+      raf = requestAnimationFrame(frame);
     };
 
-    requestAnimationFrame(draw);
-  }, [height, width, state?.roundId, state?.phase, serverNowBase, clientNowBase, rounds, view]);
+    raf = requestAnimationFrame(frame);
+    return () => cancelAnimationFrame(raf);
+  }, [clientNowBase, serverNowBase, height, width, state?.roundId, state?.phase, view]);
 
   return (
     <canvas
