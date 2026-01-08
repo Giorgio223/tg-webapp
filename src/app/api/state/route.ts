@@ -14,16 +14,19 @@ type GameState = {
 const KEY_STATE = "game:state";
 const KEY_HISTORY = "game:history";
 
+// ✅ длительности
 const BET_MS = 7000;
-const PLAY_MS = 15000; // ✅ 15 сек раунд
+const PLAY_MS = 15000;
 const END_MS = 2500;
 
-const HISTORY_LIMIT = 50;
+// ✅ история 7-8
+const HISTORY_LIMIT = 8;
 
 function newRound(startAt: number): GameState {
   return { roundId: crypto.randomUUID(), phase: "BET", phaseStartedAt: startAt };
 }
 
+// ✅ шансы
 function sampleEndPercent(): number {
   const r = Math.random();
   if (r < 0.5) return -100 + Math.random() * 100; // [-100..0]
@@ -32,9 +35,9 @@ function sampleEndPercent(): number {
   const sum = w1 + w2 + w3; // 53
   const u = Math.random() * sum;
 
-  if (u < w1) return Math.random() * 50;              // 0..50
-  if (u < w1 + w2) return 51 + Math.random() * 99;    // 51..150
-  return 150 + Math.random() * 50;                    // 150..200
+  if (u < w1) return Math.random() * 50; // 0..50
+  if (u < w1 + w2) return 51 + Math.random() * 99; // 51..150
+  return 150 + Math.random() * 50; // 150..200
 }
 
 async function ensureState(now: number) {
@@ -42,17 +45,11 @@ async function ensureState(now: number) {
   const raw = await redis.get(KEY_STATE);
   let state: GameState = raw ? JSON.parse(raw) : newRound(now);
 
-  // ✅ если вдруг phaseStartedAt "в будущем" (клиент/сервер лагали) — чиним
-  if (state.phaseStartedAt > now + 2000) {
-    state.phaseStartedAt = now;
-  }
+  // если дата "в будущем" — чиним
+  if (state.phaseStartedAt > now + 2000) state.phaseStartedAt = now;
 
   for (let i = 0; i < 120; i++) {
-    const dur =
-      state.phase === "BET" ? BET_MS :
-      state.phase === "PLAY" ? PLAY_MS :
-      END_MS;
-
+    const dur = state.phase === "BET" ? BET_MS : state.phase === "PLAY" ? PLAY_MS : END_MS;
     const phaseEndAt = state.phaseStartedAt + dur;
     if (now < phaseEndAt) break;
 
@@ -77,6 +74,7 @@ async function ensureState(now: number) {
       continue;
     }
 
+    // END -> новый BET
     state = newRound(phaseEndAt);
   }
 
@@ -84,7 +82,13 @@ async function ensureState(now: number) {
 
   const histRaw = await redis.lrange(KEY_HISTORY, 0, HISTORY_LIMIT - 1);
   const history = histRaw
-    .map((x) => { try { return JSON.parse(x); } catch { return null; } })
+    .map((x) => {
+      try {
+        return JSON.parse(x);
+      } catch {
+        return null;
+      }
+    })
     .filter(Boolean);
 
   return { state, history };

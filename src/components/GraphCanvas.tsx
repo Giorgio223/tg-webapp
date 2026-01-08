@@ -19,8 +19,8 @@ type Props = {
   state: GameState | null;
   height?: number;
   width?: number;
-  serverNowBase: number;
-  clientNowBase: number;
+  serverNowBase: number; // serverNow из API
+  clientNowBase: number; // Date.now() в момент fetch
 };
 
 type Point = { t: number; v: number };
@@ -56,29 +56,45 @@ function phaseFromSeed(seed: number, k: number) {
   return (s / 233280) * Math.PI * 2;
 }
 
+// базовый “живой” шум
 function noise(t: number, seed: number) {
   const p1 = phaseFromSeed(seed, 1);
   const p2 = phaseFromSeed(seed, 2);
   const p3 = phaseFromSeed(seed, 3);
+  const p4 = phaseFromSeed(seed, 4);
   return (
-    Math.sin(t * 1.05 + p1) * 0.62 +
-    Math.sin(t * 2.10 + p2) * 0.26 +
-    Math.sin(t * 4.20 + p3) * 0.12
+    Math.sin(t * 0.95 + p1) * 0.55 +
+    Math.sin(t * 1.90 + p2) * 0.28 +
+    Math.sin(t * 3.70 + p3) * 0.12 +
+    Math.sin(t * 6.40 + p4) * 0.05
   );
 }
 
+// редкий “удар/разворот” (детерминированно)
 function punch(t: number, seed: number) {
   const p = phaseFromSeed(seed, 9);
-  const x = (t * 0.33 + p) % 1;
-  const env = x < 0.06 ? (1 - x / 0.06) : 0;
+  const x = (t * 0.33 + p) % 1; // 0..1
+  const env = x < 0.07 ? (1 - x / 0.07) : 0;
   const dir = ((seed >> 5) & 1) ? 1 : -1;
   return env * dir;
 }
 
-function betValue(nowMs: number, state: GameState) {
+function betPure(nowMs: number, state: GameState) {
   const seed = state.seed ?? 1337;
   const t = nowMs / 1000;
   return clamp(noise(t, seed) * 8.5, -10, 10);
+}
+
+// ✅ плавное “успокоение” в BET после конца раунда (без резкого прыжка)
+function betValue(nowMs: number, state: GameState) {
+  // если только что начался BET, первые ~900мс мягко сводим к диапазону ±10
+  const elapsed = nowMs - state.phaseStartedAt;
+  const w = smoothstep(elapsed / 900);
+  const target = betPure(nowMs, state);
+
+  // startV будет храниться в historyRef (мы подцепим последнюю точку)
+  // поэтому тут возвращаем только target, а смешивание сделаем в самом draw по last value
+  return { target, w };
 }
 
 function playValue(nowMs: number, state: GameState) {
@@ -89,33 +105,44 @@ function playValue(nowMs: number, state: GameState) {
   const t = (nowMs - state.phaseStartedAt) / 1000;
 
   const mood = (seed % 1000) / 1000;
-  const aggressive = mood < 0.40;
+  const aggressive = mood < 0.45;
 
   const mid = 1 - Math.abs(t01 * 2 - 1);
-  const ampBase = aggressive ? 55 : 40;
-  const amp = ampBase * (0.45 + mid * 0.80);
+  const ampBase = aggressive ? 60 : 42;
+  const amp = ampBase * (0.45 + mid * 0.90);
 
   const raw = noise(t, seed) * amp;
-  const teaseW = smoothstep((t01 - 0.62) / 0.24) * (1 - smoothstep((t01 - 0.93) / 0.07));
-  const tease = teaseW * Math.sin(t * 5.0 + phaseFromSeed(seed, 7)) * (aggressive ? 14 : 9);
-  const hit = punch(t, seed) * (aggressive ? 18 : 12) * (0.35 + mid * 0.65);
+
+  // “пошутить под конец”
+  const teaseW = smoothstep((t01 - 0.55) / 0.25) * (1 - smoothstep((t01 - 0.93) / 0.07));
+  const teaseDir = ((seed >> 7) & 1) ? 1 : -1;
+  const tease = teaseW * teaseDir * Math.sin(t * 4.8 + phaseFromSeed(seed, 7)) * (aggressive ? 16 : 11);
+
+  // редкие удары
+  const hit = punch(t, seed) * (aggressive ? 22 : 14) * (0.35 + mid * 0.65);
 
   const noisy = clamp(raw + tease + hit, -100, 200);
 
-  const pull = smoothstep((t01 - 0.78) / 0.22); // мягче в конце
+  // магнит к финалу — последние ~22% времени
+  const pull = smoothstep((t01 - 0.78) / 0.22);
   return clamp((1 - pull) * noisy + pull * end, -100, 200);
 }
 
 export default function GraphCanvas({ state, width, height = 480, serverNowBase, clientNowBase }: Props) {
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
 
+  // история линий
   const historyRef = useRef<Point[]>([]);
   const lastTRef = useRef<number>(0);
 
-  // ✅ сглаженный offset, чтобы не было телепортов на мобиле
+  // ✅ вместо Date.now() — монотонное время (убирает микродёрги iOS)
+  const monoStartPerfRef = useRef<number>(performance.now());
+  const monoStartRealRef = useRef<number>(Date.now());
+
+  // ✅ сглаженный offset (чтобы fetch раз в 500мс не дёргал)
   const offsetRef = useRef<number>(0);
 
-  // ✅ камера: чтобы наконечник был ~85% ширины (а не в упор справа)
+  // ✅ камера: наконечник на 85% ширины
   const cameraEndXRatio = 0.85;
 
   const rafRef = useRef<number | null>(null);
@@ -136,6 +163,19 @@ export default function GraphCanvas({ state, width, height = 480, serverNowBase,
       last = ts;
       const kdt = clamp(dt / 16.7, 0.5, 2.2);
 
+      // ✅ монотонное “текущее” время клиента
+      const monoNow = monoStartRealRef.current + (performance.now() - monoStartPerfRef.current);
+
+      // ✅ целевой offset от сервера (на момент fetch)
+      const targetOffset = serverNowBase - clientNowBase;
+
+      // ✅ плавная подтяжка offset
+      const maxStep = 18 * kdt; // ms/кадр (мягче, меньше телепортов)
+      const diff = targetOffset - offsetRef.current;
+      offsetRef.current += clamp(diff, -maxStep, maxStep);
+
+      const now = monoNow + offsetRef.current;
+
       const parent = canvas.parentElement;
       const containerW = parent?.clientWidth ?? 900;
       const cssW = width ?? Math.max(320, Math.min(1400, containerW));
@@ -154,26 +194,25 @@ export default function GraphCanvas({ state, width, height = 480, serverNowBase,
       const plotH = Math.max(1, cssH - view.padT - view.padB);
       const plotR = plotL + plotW;
 
-      // ✅ targetOffset = serverNowBase - clientNowBase (на момент fetch)
-      const targetOffset = serverNowBase - clientNowBase;
-
-      // ✅ плавно тянем offset (чтобы на телефоне не прыгало)
-      // скорость изменения ограничиваем
-      const maxStep = 25 * kdt; // мс за кадр
-      const diff = targetOffset - offsetRef.current;
-      offsetRef.current += clamp(diff, -maxStep, maxStep);
-
-      const now = Date.now() + offsetRef.current;
-
       const phase: Phase = (state?.phase ?? "BET") as Phase;
+
       const showScale = phase !== "BET";
       scaleAlphaRef.current += ((showScale ? 1 : 0) - scaleAlphaRef.current) * (0.10 * kdt);
 
+      // значение сейчас
       let vNow = 0;
-      if (!state) vNow = 0;
-      else if (phase === "BET") vNow = betValue(now, state);
-      else if (phase === "PLAY") vNow = playValue(now, state);
-      else vNow = clamp(state.endPercent ?? 0, -100, 200);
+
+      if (!state) {
+        vNow = 0;
+      } else if (phase === "BET") {
+        const { target, w } = betValue(now, state);
+        const prev = historyRef.current.length ? historyRef.current[historyRef.current.length - 1].v : 0;
+        vNow = (1 - w) * prev + w * target; // ✅ плавное вхождение в BET без прыжка
+      } else if (phase === "PLAY") {
+        vNow = playValue(now, state);
+      } else {
+        vNow = clamp(state.endPercent ?? 0, -100, 200);
+      }
 
       // ✅ анти-teleport: не пишем если время “назад”
       if (now >= lastTRef.current) {
@@ -181,18 +220,18 @@ export default function GraphCanvas({ state, width, height = 480, serverNowBase,
         lastTRef.current = now;
       }
 
-      // ✅ если история пустая — добавим 1 точку
+      // страховка: всегда хотя бы точка
       if (historyRef.current.length === 0) {
         historyRef.current.push({ t: now, v: vNow });
         lastTRef.current = now;
       }
 
-      // камера: хотим, чтобы now был на 85% окна
+      // ✅ окно камеры (чтобы “экран ехал” за наконечником)
       const windowMs = view.windowMs;
       const windowStart = now - windowMs * cameraEndXRatio;
 
-      // чистим историю по окну (+ запас)
-      const cutoff = windowStart - 2000;
+      // чистка с запасом
+      const cutoff = windowStart - 2500;
       while (historyRef.current.length > 2 && historyRef.current[0].t < cutoff) historyRef.current.shift();
 
       // фон
@@ -205,7 +244,7 @@ export default function GraphCanvas({ state, width, height = 480, serverNowBase,
       ctx.lineWidth = 1;
       ctx.strokeRect(plotL, plotT, plotW, plotH);
 
-      // 0% dashed
+      // 0 dashed
       const yZero = plotT + plotH / 2;
       ctx.save();
       ctx.setLineDash([6, 6]);
@@ -222,14 +261,15 @@ export default function GraphCanvas({ state, width, height = 480, serverNowBase,
       if (vNow > 0) lineColor = "rgba(80, 220, 140, 1)";
       if (vNow > 110) lineColor = "rgba(255, 180, 60, 1)";
 
-      // ✅ glow линии (чтобы “нитка” всегда видна)
+      // линия + glow
+      const hist = historyRef.current;
+
       ctx.save();
       ctx.shadowColor = lineColor;
       ctx.shadowBlur = 14;
       ctx.lineWidth = 3.2;
       ctx.strokeStyle = lineColor;
 
-      const hist = historyRef.current;
       ctx.beginPath();
       for (let i = 0; i < hist.length; i++) {
         const p = hist[i];
@@ -241,27 +281,27 @@ export default function GraphCanvas({ state, width, height = 480, serverNowBase,
       ctx.stroke();
       ctx.restore();
 
-      // наконечник координаты
+      // наконечник
       const xHead = plotL + ((now - windowStart) / windowMs) * plotW;
       const yHead = plotT + plotH / 2 - warpPercent(vNow) * (plotH * 0.46);
 
-      // ✅ большой белый "баллончик" ореол
+      // большой “баллончик” ореол
       ctx.save();
-      ctx.globalAlpha = 0.35;
-      const halo = ctx.createRadialGradient(xHead, yHead, 2, xHead, yHead, 26);
-      halo.addColorStop(0, "rgba(255,255,255,0.95)");
+      ctx.globalAlpha = 0.38;
+      const halo = ctx.createRadialGradient(xHead, yHead, 2, xHead, yHead, 28);
+      halo.addColorStop(0, "rgba(255,255,255,0.98)");
       halo.addColorStop(1, "rgba(255,255,255,0)");
       ctx.fillStyle = halo;
       ctx.beginPath();
-      ctx.arc(xHead, yHead, 26, 0, Math.PI * 2);
+      ctx.arc(xHead, yHead, 28, 0, Math.PI * 2);
       ctx.fill();
       ctx.restore();
 
-      // ✅ белый блестящий шар
+      // белый блестящий шар
       const g = ctx.createRadialGradient(xHead - 2, yHead - 2, 2, xHead, yHead, 10);
       g.addColorStop(0, "rgba(255,255,255,1)");
-      g.addColorStop(0.5, "rgba(248,248,255,0.95)");
-      g.addColorStop(1, "rgba(200,200,220,0.25)");
+      g.addColorStop(0.55, "rgba(248,248,255,0.95)");
+      g.addColorStop(1, "rgba(200,200,220,0.20)");
 
       ctx.fillStyle = g;
       ctx.beginPath();
@@ -293,7 +333,7 @@ export default function GraphCanvas({ state, width, height = 480, serverNowBase,
         ctx.fillText(badgeText, bx + 14, by + bh / 2);
       }
 
-      // BET таймер
+      // таймер в BET
       if (state && phase === "BET") {
         const elapsed = now - state.phaseStartedAt;
         const t01 = clamp(elapsed / state.betMs, 0, 1);
