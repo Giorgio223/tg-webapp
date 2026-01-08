@@ -1,13 +1,14 @@
 "use client";
 
 import React, { useEffect, useMemo, useRef, useState } from "react";
-import GraphCanvas, { GameState } from "@/components/GraphCanvas";
+import GraphCanvas, { GameState, RoundMeta } from "@/components/GraphCanvas";
 
 type ApiResp =
   | {
       ok: true;
       state: GameState;
       history: { t: number; v: number }[];
+      rounds: RoundMeta[];
       serverNow: number;
     }
   | { ok: false; error: string };
@@ -15,9 +16,10 @@ type ApiResp =
 export default function Page() {
   const [state, setState] = useState<GameState | null>(null);
   const [history, setHistory] = useState<{ t: number; v: number }[]>([]);
+  const [rounds, setRounds] = useState<RoundMeta[]>([]);
   const [serverNowBase, setServerNowBase] = useState<number>(Date.now());
   const [clientNowBase, setClientNowBase] = useState<number>(Date.now());
-  const [balance, setBalance] = useState<number>(0);
+  const [balance] = useState<number>(0);
 
   const fetchingRef = useRef(false);
 
@@ -45,10 +47,10 @@ export default function Page() {
       if (data.ok) {
         setState(data.state);
         setHistory(Array.isArray(data.history) ? data.history : []);
+        setRounds(Array.isArray(data.rounds) ? data.rounds : []);
         setServerNowBase(data.serverNow);
         setClientNowBase(clientNow);
       } else {
-        // можно вывести тост/лог
         console.error("API error:", data.error);
       }
     } catch (e) {
@@ -65,108 +67,49 @@ export default function Page() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  const historyNewestFirst = history; // сервер уже отдаёт newest-first
-
   return (
-    <div
-      style={{
-        minHeight: "100vh",
-        background: "#070c14",
-        color: "rgba(255,255,255,0.92)",
-        padding: "18px 18px 24px",
-      }}
-    >
-      {/* Header */}
-      <div
-        style={{
-          display: "flex",
-          alignItems: "center",
-          gap: 14,
-          justifyContent: "space-between",
-          marginBottom: 14,
-        }}
-      >
+    <div style={{ minHeight: "100vh", background: "#070c14", color: "rgba(255,255,255,0.92)", padding: "18px 18px 24px" }}>
+      <div style={{ display: "flex", alignItems: "center", gap: 14, justifyContent: "space-between", marginBottom: 14 }}>
         <div style={{ fontSize: 38, fontWeight: 800, letterSpacing: 0.2 }}>Game</div>
 
         <div style={{ display: "flex", gap: 12, alignItems: "center" }}>
-          <button
-            style={topBtnStyle}
-            onClick={() => {
-              // TODO: тут подключишь свою логику пополнения
-              alert("Пополнение (заглушка)");
-            }}
-          >
-            Пополнение
-          </button>
-
+          <button style={topBtnStyle} onClick={() => alert("Пополнение (заглушка)")}>Пополнение</button>
           <div style={{ ...topBtnStyle, cursor: "default" }}>Баланс: {balance.toFixed(2)}</div>
-
-          <button
-            style={topBtnStyle}
-            onClick={() => {
-              alert("Бонус (заглушка)");
-            }}
-          >
-            Бонус
-          </button>
+          <button style={topBtnStyle} onClick={() => alert("Бонус (заглушка)")}>Бонус</button>
         </div>
       </div>
 
-      {/* Card */}
-      <div
-        style={{
-          borderRadius: 22,
-          background: "radial-gradient(1200px 600px at 30% 10%, rgba(34,65,120,0.22), rgba(0,0,0,0))",
-          border: "1px solid rgba(255,255,255,0.08)",
-          boxShadow: "0 20px 70px rgba(0,0,0,0.45)",
-          padding: 18,
-        }}
-      >
+      <div style={{ borderRadius: 22, background: "radial-gradient(1200px 600px at 30% 10%, rgba(34,65,120,0.22), rgba(0,0,0,0))", border: "1px solid rgba(255,255,255,0.08)", boxShadow: "0 20px 70px rgba(0,0,0,0.45)", padding: 18 }}>
         <div style={{ marginBottom: 10 }}>
-          <div style={{ fontSize: 14, opacity: 0.75 }}>
-            Inside Telegram: <b>{isTelegram ? "YES" : "NO"}</b>
-          </div>
-          <div style={{ fontSize: 14, opacity: 0.75 }}>
-            initData: <span style={{ opacity: 0.6 }}>{initData ? "(present)" : "(empty)"}</span>
-          </div>
+          <div style={{ fontSize: 14, opacity: 0.75 }}>Inside Telegram: <b>{isTelegram ? "YES" : "NO"}</b></div>
+          <div style={{ fontSize: 14, opacity: 0.75 }}>initData: <span style={{ opacity: 0.6 }}>{initData ? "(present)" : "(empty)"}</span></div>
         </div>
 
         <div style={{ borderRadius: 18, overflow: "hidden" }}>
           <GraphCanvas
             state={state}
+            rounds={rounds}
             height={520}
             serverNowBase={serverNowBase}
             clientNowBase={clientNowBase}
           />
         </div>
 
-        {/* History (last 8) */}
         <div style={{ marginTop: 14 }}>
-          <div style={{ fontSize: 13, opacity: 0.7, marginBottom: 10 }}>История</div>
+          <div style={{ fontSize: 13, opacity: 0.7, marginBottom: 10 }}>История (последние 8)</div>
 
-          <div
-            style={{
-              display: "flex",
-              gap: 10,
-              overflowX: "auto",
-              paddingBottom: 6,
-              scrollbarWidth: "thin",
-            }}
-          >
-            {historyNewestFirst.length === 0 ? (
+          <div style={{ display: "flex", gap: 10, overflowX: "auto", paddingBottom: 6, scrollbarWidth: "thin" }}>
+            {history.length === 0 ? (
               <div style={{ opacity: 0.6, fontSize: 13 }}>Пока пусто…</div>
             ) : (
-              historyNewestFirst.map((h, idx) => {
+              history.map((h, idx) => {
                 const v = Number(h.v);
                 const isUp = v >= 0;
 
                 const bg = isUp ? "rgba(34,197,94,0.18)" : "rgba(239,68,68,0.18)";
                 const bd = isUp ? "rgba(34,197,94,0.35)" : "rgba(239,68,68,0.35)";
                 const col = isUp ? "rgba(80,220,140,0.95)" : "rgba(255,90,90,0.95)";
-
-                const tri = isUp
-                  ? "polygon(50% 0%, 0% 100%, 100% 100%)" // ▲
-                  : "polygon(0% 0%, 100% 0%, 50% 100%)"; // ▼
+                const tri = isUp ? "polygon(50% 0%, 0% 100%, 100% 100%)" : "polygon(0% 0%, 100% 0%, 50% 100%)";
 
                 return (
                   <div
@@ -185,19 +128,7 @@ export default function Page() {
                       letterSpacing: 0.2,
                     }}
                   >
-                    <div
-                      style={{
-                        width: 10,
-                        height: 10,
-                        background: "rgba(255,255,255,0.92)",
-                        clipPath: tri,
-                        position: "absolute",
-                        left: "50%",
-                        transform: "translateX(-50%)",
-                        top: 6,
-                        opacity: 0.95,
-                      }}
-                    />
+                    <div style={{ width: 10, height: 10, background: "rgba(255,255,255,0.92)", clipPath: tri, position: "absolute", left: "50%", transform: "translateX(-50%)", top: 6, opacity: 0.95 }} />
                     <div style={{ paddingTop: 8 }}>{v.toFixed(0)}%</div>
                   </div>
                 );
@@ -207,49 +138,10 @@ export default function Page() {
         </div>
       </div>
 
-      {/* Buttons */}
-      <div
-        style={{
-          marginTop: 16,
-          display: "grid",
-          gridTemplateColumns: "1fr 1fr 1fr",
-          gap: 14,
-        }}
-      >
-        <button
-          style={{
-            ...actionBtnStyle,
-            background: "rgba(220,38,38,0.70)",
-            border: "1px solid rgba(255,255,255,0.10)",
-          }}
-          onClick={() => alert("Down (заглушка)")}
-        >
-          Down
-        </button>
-
-        <button
-          style={{
-            ...actionBtnStyle,
-            background: "rgba(22,163,74,0.72)",
-            border: "1px solid rgba(255,255,255,0.10)",
-            color: "rgba(0,0,0,0.85)",
-            fontWeight: 900,
-          }}
-          onClick={() => alert("Up (заглушка)")}
-        >
-          Up
-        </button>
-
-        <button
-          style={{
-            ...actionBtnStyle,
-            background: "rgba(124,58,237,0.70)",
-            border: "1px solid rgba(255,255,255,0.10)",
-          }}
-          onClick={() => alert("Insurance (заглушка)")}
-        >
-          Insurance
-        </button>
+      <div style={{ marginTop: 16, display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 14 }}>
+        <button style={{ ...actionBtnStyle, background: "rgba(220,38,38,0.70)", border: "1px solid rgba(255,255,255,0.10)" }} onClick={() => alert("Down (заглушка)")}>Down</button>
+        <button style={{ ...actionBtnStyle, background: "rgba(22,163,74,0.72)", border: "1px solid rgba(255,255,255,0.10)", color: "rgba(0,0,0,0.85)", fontWeight: 900 }} onClick={() => alert("Up (заглушка)")}>Up</button>
+        <button style={{ ...actionBtnStyle, background: "rgba(124,58,237,0.70)", border: "1px solid rgba(255,255,255,0.10)" }} onClick={() => alert("Insurance (заглушка)")}>Insurance</button>
       </div>
     </div>
   );
